@@ -1,4 +1,4 @@
-ï»¿ticker,date,c_x,change,v,h_y,v_y,oneminvol_y,stddev,count,day_ratio_15,lo_breakout,Predictions_change3
+﻿ticker,date,c_x,change,v,h_y,v_y,oneminvol_y,stddev,count,day_ratio_15,lo_breakout,Predictions_change3
 AA,2021-04-20,32.98,-0.2220372,11140616,0,1,0,3791.228,72919,4,0,
 AA,2021-04-22,33.21,0.20431991,5500292,0,0,0,2052.5728,40834,7,59,
 AA,2021-04-23,34.71,4.968383,4912439,2,0,3,2249.2815,35913,7,60,
