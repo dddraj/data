@@ -14,7 +14,12 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .. import curves
-from ..invariants import check_constant_product_pair, diagnose_pair
+from ..invariants import (
+    check_constant_product_pair,
+    check_reserve_offset,
+    classify_variant,
+    diagnose_pair,
+)
 from ..types import CurveFamily, LaunchMetrics, ValueSource, price_raw_to_ui, ui_amount
 from .base import Adapter, DecodeContext
 
@@ -85,10 +90,22 @@ class PumpFunAdapter(Adapter):
         )
 
         init_v_base = cfg.get("initial_virtual_token_reserves")
-        init_v_quote = pick(
-            cfg, "initial_virtual_sol_reserves", "initial_virtual_quote_reserves"
-        )
         init_real_base = cfg.get("initial_real_token_reserves")
+
+        # pump.fun seeds SOL-quoted and non-SOL-quoted curves with *different*
+        # opening reserves, and the account does not say which it is. The
+        # difference between the virtual and real quote reserve does: the
+        # program moves both together, so that difference is the opening
+        # constant, unchanged for the curve's whole life.
+        candidates = {
+            "sol": cfg.get("initial_virtual_sol_reserves"),
+            "quote": cfg.get("initial_virtual_quote_reserves"),
+        }
+        candidates = {k: v for k, v in candidates.items() if v}
+        variant, init_v_quote = classify_variant(v_quote, real_quote, candidates)
+        if variant is None:
+            init_v_quote = candidates.get("sol") or next(iter(candidates.values()), None)
+        m.curve_type = f"constant_product:{variant or 'unclassified'}"
 
         m.tokens_for_sale = self.param(
             ui_amount(init_real_base, m.base_decimals), cfg_source, cfg_slot
@@ -170,7 +187,7 @@ class PumpFunAdapter(Adapter):
         # nothing else would catch it.
         violations = check_constant_product_pair(
             v_base, v_quote, init_v_base, init_v_quote
-        )
+        ) + check_reserve_offset(v_quote, real_quote, candidates)
         if violations:
             m.raw_state = {
                 **state,

@@ -29,7 +29,7 @@ Bucketing the observed k ratio tells the two apart immediately.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 #: k only ever creeps up, by parts per billion. 0.5% is far beyond any
 #: legitimate drift while staying clear of floating-point noise.
@@ -48,6 +48,64 @@ class Violation:
 
     def __str__(self) -> str:
         return f"{self.name}: {self.detail}"
+
+
+def classify_variant(
+    virtual_quote: Optional[int],
+    real_quote: Optional[int],
+    candidates: Dict[str, int],
+) -> Tuple[Optional[str], Optional[int]]:
+    """Which opening constant a curve was seeded with, read off its reserves.
+
+    pump.fun's buy and sell add the post-fee amount to the virtual *and* the
+    real quote reserve together, so their difference never moves:
+
+        virtual_quote - real_quote == initial_virtual_quote_reserves
+
+    for the whole life of the curve. That makes the difference an exact
+    classifier. It beats matching k against each candidate, because it needs no
+    tolerance and -- unlike counting curves that still sit near their opening
+    value -- it keeps working after the curve has traded away from it.
+
+    Returns ``(variant name, its opening constant)``, or ``(None, observed
+    offset)`` when the difference matches nothing, which means the pair did not
+    come from one read.
+    """
+    if virtual_quote is None or real_quote is None:
+        return None, None
+    offset = virtual_quote - real_quote
+    for name, initial in candidates.items():
+        if initial and offset == initial:
+            return name, initial
+    return None, offset
+
+
+def check_reserve_offset(
+    virtual_quote: Optional[int],
+    real_quote: Optional[int],
+    candidates: Dict[str, int],
+) -> List[Violation]:
+    """Flag a curve whose virtual/real quote difference matches no opening.
+
+    An offset of roughly zero is the signature of the virtual column carrying
+    the *real* reserve -- the two are then the same number, or the real one was
+    defaulted away.
+    """
+    variant, offset = classify_variant(virtual_quote, real_quote, candidates)
+    if variant is not None or offset is None:
+        return []
+    known = ", ".join(f"{name}={value}" for name, value in candidates.items() if value)
+    detail = (
+        f"virtual_quote - real_quote is {offset}, which matches no opening "
+        f"constant ({known}). That difference is fixed for a curve's whole life, "
+        f"so this pair did not come from one read"
+    )
+    if virtual_quote is not None and abs(offset) < min(v for v in candidates.values() if v) // 2:
+        detail += (
+            "; an offset near zero is what a virtual column carrying the REAL "
+            "reserve looks like"
+        )
+    return [Violation("reserve_offset_mismatch", detail)]
 
 
 def check_constant_product_pair(

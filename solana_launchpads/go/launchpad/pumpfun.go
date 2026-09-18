@@ -34,6 +34,12 @@ type PumpfunParams struct {
 	TokenTotalSupply    uint64
 	FeeBasisPoints      uint64
 
+	// Variants holds every opening quote reserve the program seeds curves
+	// with. pump.fun uses one for SOL-quoted coins and another for non-SOL
+	// ones, and the curve account does not say which it is -- the difference
+	// between its virtual and real quote reserve does.
+	Variants VariantCandidates
+
 	// derived once
 	RaiseTargetRaw     uint64
 	LaunchPriceRaw     float64
@@ -58,6 +64,10 @@ func NewPumpfunParams(g *PumpfunGlobal, quoteDecimals int) PumpfunParams {
 		FeeBasisPoints:      g.FeeBasisPoints,
 		QuoteDecimals:       quoteDecimals,
 		FromChain:           true,
+		Variants: VariantCandidates{
+			"sol":   g.InitialVirtualSolReserves,
+			"quote": g.InitialVirtualQuoteReserves,
+		},
 	}
 	p.derive()
 	return p
@@ -86,6 +96,24 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		quoteDec = 9
 	}
 
+	// Which opening was this curve seeded with? Read it off the reserves
+	// rather than assuming, or a non-SOL-quoted curve is priced against the
+	// SOL opening and every number comes out wrong.
+	variant, _ := ClassifyVariant(c.VirtualQuoteReserves, c.RealQuoteReserves, p.Variants)
+	openingQuote := p.InitialVirtualQuote
+	if variant != "" {
+		openingQuote = p.Variants[variant]
+	}
+	curveType := "constant_product:unclassified"
+	if variant != "" {
+		curveType = "constant_product:" + variant
+	}
+	derived := p
+	if openingQuote != p.InitialVirtualQuote {
+		derived.InitialVirtualQuote = openingQuote
+		derived.derive()
+	}
+
 	paramsSource := SourceOnchainConfig
 	if !p.FromChain {
 		paramsSource = SourceFallback
@@ -100,7 +128,7 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		Launchpad:     "pumpfun",
 		ProgramID:     PumpfunProgramID,
 		Family:        FamilyConstantProductVirtual,
-		CurveType:     "constant_product",
+		CurveType:     curveType,
 		BaseMint:      Pubkey{},
 		QuoteMint:     c.QuoteMint,
 		BaseDecimals:  baseDec,
@@ -108,7 +136,7 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		TotalSupply:   UIAmount(totalSupply, baseDec),
 		TokensForSale: UIAmount(p.InitialRealBase, baseDec),
 		Raised:        UIAmount(c.RealQuoteReserves, quoteDec),
-		RaiseTarget:   UIAmount(p.RaiseTargetRaw, quoteDec),
+		RaiseTarget:   UIAmount(derived.RaiseTargetRaw, quoteDec),
 		Complete:      c.Complete,
 		Migrated:      c.Complete,
 		FeeBps:        float64(p.FeeBasisPoints + c.CreatorFeeBps),
@@ -116,8 +144,8 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		ParamsSource:  paramsSource,
 		TruncatedAt:   truncatedAt,
 	}
-	m.LaunchPrice = PriceUI(p.LaunchPriceRaw, baseDec, quoteDec)
-	m.GraduationPrice = PriceUI(p.GraduationPriceRaw, baseDec, quoteDec)
+	m.LaunchPrice = PriceUI(derived.LaunchPriceRaw, baseDec, quoteDec)
+	m.GraduationPrice = PriceUI(derived.GraduationPriceRaw, baseDec, quoteDec)
 	if c.VirtualTokenReserves > 0 {
 		m.CurrentPrice = PriceUI(
 			CPPriceRaw(c.VirtualQuoteReserves, c.VirtualTokenReserves), baseDec, quoteDec)
@@ -131,12 +159,14 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 	// from the same read, and nothing else would catch it.
 	m.Violations = CheckConstantProductPair(
 		c.VirtualTokenReserves, c.VirtualQuoteReserves,
-		p.InitialVirtualBase, p.InitialVirtualQuote)
+		derived.InitialVirtualBase, derived.InitialVirtualQuote)
+	m.Violations = append(m.Violations,
+		CheckReserveOffset(c.VirtualQuoteReserves, c.RealQuoteReserves, p.Variants)...)
 	if len(m.Violations) > 0 {
 		m.PriceSource = "SUSPECT"
 		m.SuspectField, _ = DiagnosePair(
 			c.VirtualTokenReserves, c.VirtualQuoteReserves,
-			p.InitialVirtualBase, p.InitialVirtualQuote, p.InitialRealBase)
+			derived.InitialVirtualBase, derived.InitialVirtualQuote, derived.InitialRealBase)
 	}
 
 	m.fillDerived()

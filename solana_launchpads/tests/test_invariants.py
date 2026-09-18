@@ -21,6 +21,8 @@ from launchpad_decoder.anchor_idl import compile_idl  # noqa: E402
 from launchpad_decoder.invariants import (  # noqa: E402
     check_constant_product_pair,
     check_metrics,
+    check_reserve_offset,
+    classify_variant,
     diagnose_pair,
 )
 from launchpad_decoder.registry import get as get_spec  # noqa: E402
@@ -175,3 +177,118 @@ def test_price_level_invariants_are_quiet_on_a_healthy_curve():
     v_base = (IVT * IVS) // v_quote
     m = decode_curve(v_base, v_quote, real_quote_reserves=paid)
     assert check_metrics(m) == []
+
+
+# --------------------------------------------------------------------------
+# variant classification, from the reserve offset
+# --------------------------------------------------------------------------
+
+IVQ = 4_292_000_000  # pump.fun's opening for non-SOL quote pairs
+CANDIDATES = {"sol": IVS, "quote": IVQ}
+
+
+def test_reserve_offset_classifies_a_traded_sol_curve():
+    """The offset is fixed for life, so trading does not blur the classifier."""
+    for paid in (0, 1_000_000_000, 42_500_000_000, 85_005_359_057):
+        variant, initial = classify_variant(IVS + paid, paid, CANDIDATES)
+        assert variant == "sol", paid
+        assert initial == IVS
+
+
+def test_reserve_offset_classifies_a_traded_quote_curve():
+    """The 4.292 variant is the one a narrow band around the opening misses."""
+    for paid in (0, 500_000_000, 12_000_000_000):
+        variant, initial = classify_variant(IVQ + paid, paid, CANDIDATES)
+        assert variant == "quote", paid
+        assert initial == IVQ
+
+
+def test_reserve_offset_reports_an_unclassifiable_pair():
+    variant, offset = classify_variant(18_204_928_211, 1, CANDIDATES)
+    assert variant is None
+    assert offset == 18_204_928_210
+
+
+def test_a_virtual_column_holding_the_real_reserve_is_named_as_such():
+    """The residual signature: the two columns carry the same number."""
+    violations = check_reserve_offset(670_000_000, 670_000_000, CANDIDATES)
+    assert [v.name for v in violations] == ["reserve_offset_mismatch"]
+    assert "carrying the REAL reserve" in violations[0].detail
+
+
+def test_a_healthy_curve_raises_no_offset_violation():
+    assert check_reserve_offset(IVS + 5_000_000_000, 5_000_000_000, CANDIDATES) == []
+    assert check_reserve_offset(IVQ + 5_000_000_000, 5_000_000_000, CANDIDATES) == []
+
+
+def test_missing_real_reserve_cannot_be_classified_but_is_not_a_violation():
+    assert classify_variant(IVS, None, CANDIDATES) == (None, None)
+    assert check_reserve_offset(IVS, None, CANDIDATES) == []
+
+
+def decode_with_variants(virtual_quote, real_quote, virtual_base=None):
+    """Decode a curve against a Global carrying BOTH opening constants."""
+    idl = json.loads((IDL_DIR / "pump.json").read_text())
+    schema = compile_idl(idl)
+    source = StaticAccountSource(slot=5)
+    source.add_raw(
+        pdas.pumpfun_global(),
+        PUMP.program_id,
+        encode_account(
+            idl,
+            schema,
+            "Global",
+            {
+                "initial_virtual_token_reserves": IVT,
+                "initial_virtual_sol_reserves": IVS,
+                "initial_virtual_quote_reserves": IVQ,
+                "initial_real_token_reserves": IRT,
+                "token_total_supply": 1_000_000_000_000_000,
+                "fee_basis_points": 100,
+            },
+        ),
+    )
+    address = "So11111111111111111111111111111111111111112"
+    source.add_raw(
+        address,
+        PUMP.program_id,
+        encode_account(
+            idl,
+            schema,
+            "BondingCurve",
+            {
+                "virtual_token_reserves": virtual_base if virtual_base else IVT,
+                "virtual_quote_reserves": virtual_quote,
+                "real_quote_reserves": real_quote,
+                "real_token_reserves": IRT,
+                "token_total_supply": 1_000_000_000_000_000,
+            },
+        ),
+    )
+    return LaunchpadDecoder(source, resolve_mints=False).decode_address(address)
+
+
+def test_decoder_prices_a_quote_variant_curve_against_its_own_opening():
+    """Previously this was judged against the 30 SOL opening and came out wrong."""
+    m = decode_with_variants(IVQ, 0)
+    assert m.curve_type == "constant_product:quote"
+    assert not [w for w in m.warnings if "k_violation" in w]
+    # 4.292e9 / 1.073e15 raw, and a 6-decimal quote leaves it unscaled
+    assert m.launch_price_quote.value == pytest.approx(4.0e-6 * 1e-3, rel=1e-9)
+    assert m.raise_target_quote.value == pytest.approx(12.162, rel=1e-3)
+
+
+def test_decoder_still_prices_a_sol_variant_curve_the_same_way():
+    m = decode_with_variants(IVS, 0)
+    assert m.curve_type == "constant_product:sol"
+    assert m.raise_target_quote.value == pytest.approx(85.005359, rel=1e-6)
+    assert not m.warnings or not [w for w in m.warnings if "k_violation" in w]
+
+
+def test_decoder_flags_the_residual_signature():
+    """virtual_quote carrying the real reserve: offset collapses to zero."""
+    m = decode_with_variants(670_000_000, 670_000_000)
+    joined = " ".join(m.warnings)
+    assert "reserve_offset_mismatch" in joined
+    assert "carrying the REAL reserve" in joined
+    assert m.curve_type == "constant_product:unclassified"

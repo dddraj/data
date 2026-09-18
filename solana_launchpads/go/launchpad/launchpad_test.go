@@ -323,3 +323,103 @@ func BenchmarkDecodeAndPrice(b *testing.B) {
 		_ = params.Metrics(&curve, truncatedAt)
 	}
 }
+
+// --------------------------------------------------------------------------
+// variant classification
+// --------------------------------------------------------------------------
+
+const ivq = 4_292_000_000 // pump.fun's opening for non-SOL quote pairs
+
+func variants() VariantCandidates {
+	return VariantCandidates{"sol": ivs, "quote": ivq}
+}
+
+func TestReserveOffsetClassifiesATradedSolCurve(t *testing.T) {
+	// The offset is fixed for the curve's life, so trading does not blur it --
+	// which is exactly where counting curves near their opening value fails.
+	for _, paid := range []uint64{0, 1_000_000_000, 42_500_000_000, 85_005_359_057} {
+		variant, _ := ClassifyVariant(ivs+paid, paid, variants())
+		if variant != "sol" {
+			t.Errorf("paid %d: got %q, want sol", paid, variant)
+		}
+	}
+}
+
+func TestReserveOffsetClassifiesATradedQuoteCurve(t *testing.T) {
+	for _, paid := range []uint64{0, 500_000_000, 12_000_000_000} {
+		variant, _ := ClassifyVariant(ivq+paid, paid, variants())
+		if variant != "quote" {
+			t.Errorf("paid %d: got %q, want quote", paid, variant)
+		}
+	}
+}
+
+func TestReserveOffsetReportsAnUnclassifiablePair(t *testing.T) {
+	variant, offset := ClassifyVariant(18_204_928_211, 1, variants())
+	if variant != "" {
+		t.Errorf("got %q, want no variant", variant)
+	}
+	if offset != 18_204_928_210 {
+		t.Errorf("offset = %d", offset)
+	}
+}
+
+func TestAVirtualColumnHoldingTheRealReserveIsNamedAsSuch(t *testing.T) {
+	violations := CheckReserveOffset(670_000_000, 670_000_000, variants())
+	if len(violations) != 1 || violations[0].Name != "reserve_offset_mismatch" {
+		t.Fatalf("got %v", violations)
+	}
+	if !contains(violations[0].Detail, "carrying the REAL reserve") {
+		t.Errorf("detail should name the likely cause: %s", violations[0].Detail)
+	}
+}
+
+func TestHealthyCurvesRaiseNoOffsetViolation(t *testing.T) {
+	if v := CheckReserveOffset(ivs+5_000_000_000, 5_000_000_000, variants()); v != nil {
+		t.Errorf("SOL variant: got %v", v)
+	}
+	if v := CheckReserveOffset(ivq+5_000_000_000, 5_000_000_000, variants()); v != nil {
+		t.Errorf("quote variant: got %v", v)
+	}
+	if v := CheckReserveOffset(ivs, 0, nil); v != nil {
+		t.Errorf("no candidates means no judgement, got %v", v)
+	}
+}
+
+func TestQuoteVariantIsPricedAgainstItsOwnOpening(t *testing.T) {
+	// Judging this curve against the 30 SOL opening is what made a whole
+	// population look broken when it was healthy all along.
+	params := PumpfunParams{
+		InitialVirtualBase: ivt, InitialVirtualQuote: ivs,
+		InitialRealBase: irt, QuoteDecimals: 9, FromChain: true,
+		Variants: variants(),
+	}
+	params.derive()
+
+	curve := PumpfunBondingCurve{
+		VirtualTokenReserves: ivt,
+		VirtualQuoteReserves: ivq,
+		RealQuoteReserves:    0,
+		RealTokenReserves:    irt,
+		TokenTotalSupply:     1_000_000_000_000_000,
+	}
+	m := params.Metrics(&curve, "")
+	if m.CurveType != "constant_product:quote" {
+		t.Errorf("curve type = %q", m.CurveType)
+	}
+	if !m.OK() {
+		t.Errorf("a healthy quote-variant curve should not be flagged: %v", m.Violations)
+	}
+	if want := PriceUI(float64(ivq)/float64(ivt), 6, 9); math.Abs(m.LaunchPrice-want)/want > 1e-12 {
+		t.Errorf("launch price = %g, want %g", m.LaunchPrice, want)
+	}
+}
+
+func contains(haystack, needle string) bool {
+	for i := 0; i+len(needle) <= len(haystack); i++ {
+		if haystack[i:i+len(needle)] == needle {
+			return true
+		}
+	}
+	return false
+}

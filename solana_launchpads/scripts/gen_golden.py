@@ -35,7 +35,12 @@ SUPPLY = 1_000_000_000_000_000
 
 #: the invariant names the decoder can emit, so prose warnings are not
 #: mistaken for violations
-VIOLATION_NAMES = ("k_violation", "quote_below_open", "base_above_open")
+VIOLATION_NAMES = (
+    "k_violation",
+    "quote_below_open",
+    "base_above_open",
+    "reserve_offset_mismatch",
+)
 
 GLOBAL_FIELDS = {
     "initial_virtual_token_reserves": IVT,
@@ -46,11 +51,17 @@ GLOBAL_FIELDS = {
 }
 
 
-def case(name: str, note: str, curve_fields: dict, truncate_to: int | None = None) -> dict:
+def case(
+    name: str,
+    note: str,
+    curve_fields: dict,
+    truncate_to: int | None = None,
+    global_extra: dict | None = None,
+) -> dict:
     idl = json.loads((IDL_DIR / "pump.json").read_text())
     schema = compile_idl(idl)
 
-    global_blob = encode_account(idl, schema, "Global", GLOBAL_FIELDS)
+    global_blob = encode_account(idl, schema, "Global", {**GLOBAL_FIELDS, **(global_extra or {})})
     curve_blob = encode_account(idl, schema, "BondingCurve", curve_fields)
     if truncate_to is not None:
         curve_blob = curve_blob[:truncate_to]
@@ -148,6 +159,32 @@ def main() -> None:
                 "real_quote_reserves": 1,
                 "token_total_supply": SUPPLY,
             },
+        ),
+        case(
+            "quote_variant_curve",
+            "pump.fun seeds non-SOL-quoted curves at 4.292 rather than 30; judging "
+            "one against the SOL opening makes every number wrong",
+            {
+                "virtual_token_reserves": IVT,
+                "virtual_quote_reserves": 4_292_000_000,
+                "real_token_reserves": IRT,
+                "real_quote_reserves": 0,
+                "token_total_supply": SUPPLY,
+            },
+            global_extra={"initial_virtual_quote_reserves": 4_292_000_000},
+        ),
+        case(
+            "quote_variant_traded",
+            "the same variant after trading, where a narrow band around the "
+            "opening no longer finds it but the reserve offset still does",
+            {
+                "virtual_token_reserves": (IVT * 4_292_000_000) // 9_292_000_000,
+                "virtual_quote_reserves": 9_292_000_000,
+                "real_token_reserves": IRT - 100_000_000_000_000,
+                "real_quote_reserves": 5_000_000_000,
+                "token_total_supply": SUPPLY,
+            },
+            global_extra={"initial_virtual_quote_reserves": 4_292_000_000},
         ),
         case(
             "legacy_truncated_account",

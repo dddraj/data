@@ -80,6 +80,43 @@ graduate, ~411 SOL at migration. `tests/test_curves.py` pins all of them.
 Note `raiseTarget` is **pre-fee**. pump.fun charges `fee_basis_points` on top,
 so a buyer pays ≈ 85.005 × 1.01 SOL to fill the curve.
 
+### The reserve offset, and why it beats matching k
+
+pump.fun's buy and sell add the post-fee amount to the virtual **and** the real
+quote reserve together. So their difference never moves:
+
+```
+virtual_quote - real_quote == initial_virtual_quote_reserves
+```
+
+for the whole life of the curve, through any number of buys and sells.
+
+That is more useful than it looks, because pump.fun seeds **two** kinds of curve
+with different openings — 30 SOL for SOL-quoted coins, and
+`initial_virtual_quote_reserves` (4.292 at the time of writing) for non-SOL ones
+— and the curve account does not record which it is. The offset does, exactly:
+
+| `virtual_quote - real_quote` | variant |
+|---|---|
+| `initial_virtual_sol_reserves` | SOL-quoted |
+| `initial_virtual_quote_reserves` | non-SOL-quoted |
+| anything else | the pair did not come from one read |
+
+This beats classifying by matching k against each candidate, for two reasons.
+It needs no tolerance — it is integer equality. And it keeps working after the
+curve has traded away from its opening, whereas counting curves that still sit
+in a narrow band *around* an opening value finds almost none of them, because
+curves that trade leave the band immediately.
+
+An offset near zero is its own diagnosis: that is what a virtual column
+carrying the **real** reserve looks like, since the two are then the same
+number or the real one was defaulted away.
+
+Both opening constants give the same launch market cap in fiat terms, which is
+a useful sanity check on the reading: 30 SOL over 1.073e9 tokens is ~28 SOL,
+and 4.292 over the same supply is 4,000 in a 6-decimal quote — both about
+$4,000 at the SOL price the constants were chosen at.
+
 ---
 
 ## 2. Linear price

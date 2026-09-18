@@ -2,6 +2,7 @@ package launchpad
 
 import (
 	"fmt"
+	"math"
 	"math/big"
 )
 
@@ -178,4 +179,72 @@ func divU128ByU64(value U128, divisor uint64) uint64 {
 		return 0
 	}
 	return n.Uint64()
+}
+
+// VariantCandidates maps a variant name to the opening quote reserve pump.fun
+// seeds that variant with. SOL-quoted and non-SOL-quoted curves get different
+// openings and the account does not say which it is.
+type VariantCandidates map[string]uint64
+
+// ClassifyVariant reports which opening constant a curve was seeded with, read
+// off the reserves themselves.
+//
+// pump.fun's buy and sell add the post-fee amount to the virtual *and* the real
+// quote reserve together, so their difference never moves:
+//
+//	virtual_quote - real_quote == initial_virtual_quote_reserves
+//
+// for the whole life of the curve. That makes the difference an exact
+// classifier: no tolerance, and it keeps working after a curve has traded well
+// away from its opening, which is exactly where counting curves still sitting
+// near that opening fails.
+//
+// Returns the variant name and its constant, or ("", observed offset) when the
+// difference matches nothing -- which means the pair did not come from one read.
+func ClassifyVariant(virtualQuote, realQuote uint64, candidates VariantCandidates) (string, int64) {
+	offset := int64(virtualQuote) - int64(realQuote)
+	for name, initial := range candidates {
+		if initial != 0 && offset == int64(initial) {
+			return name, offset
+		}
+	}
+	return "", offset
+}
+
+// CheckReserveOffset flags a curve whose virtual/real quote difference matches
+// no opening constant.
+//
+// An offset near zero is the signature of the virtual column carrying the
+// *real* reserve: the two are then the same number, or the real one was
+// defaulted away by a later write on the same key.
+func CheckReserveOffset(virtualQuote, realQuote uint64, candidates VariantCandidates) []Violation {
+	if len(candidates) == 0 {
+		return nil
+	}
+	variant, offset := ClassifyVariant(virtualQuote, realQuote, candidates)
+	if variant != "" {
+		return nil
+	}
+
+	smallest := uint64(math.MaxUint64)
+	for _, initial := range candidates {
+		if initial != 0 && initial < smallest {
+			smallest = initial
+		}
+	}
+	detail := fmt.Sprintf(
+		"virtual_quote - real_quote is %d, which matches no opening constant. "+
+			"That difference is fixed for a curve's whole life, so this pair did "+
+			"not come from one read", offset)
+	if abs64(offset) < int64(smallest/2) {
+		detail += "; an offset near zero is what a virtual column carrying the REAL reserve looks like"
+	}
+	return []Violation{{Name: "reserve_offset_mismatch", Detail: detail, Severity: SeverityError}}
+}
+
+func abs64(v int64) int64 {
+	if v < 0 {
+		return -v
+	}
+	return v
 }
