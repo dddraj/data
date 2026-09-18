@@ -14,6 +14,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 from .. import curves
+from ..invariants import check_constant_product_pair, diagnose_pair
 from ..types import CurveFamily, LaunchMetrics, ValueSource, price_raw_to_ui, ui_amount
 from .base import Adapter, DecodeContext
 
@@ -161,6 +162,33 @@ class PumpFunAdapter(Adapter):
                 cfg_source,
                 cfg_slot,
                 "protocol fee_basis_points + creator fee",
+            )
+
+        # Does the decoded pair actually lie on the curve? A pair that is
+        # individually plausible but whose product is not k means the two
+        # reserves did not come from the same read -- the price is wrong and
+        # nothing else would catch it.
+        violations = check_constant_product_pair(
+            v_base, v_quote, init_v_base, init_v_quote
+        )
+        if violations:
+            m.raw_state = {
+                **state,
+                "_initial_virtual_base": init_v_base,
+                "_initial_virtual_quote": init_v_quote,
+            }
+            suspect, explanation = diagnose_pair(
+                v_base, v_quote, init_v_base, init_v_quote, init_real_base
+            )
+            for violation in violations:
+                m.warn(str(violation))
+            if suspect:
+                m.warn(f"suspect field: {suspect} -- {explanation}")
+            m.current_price_quote = self.param(
+                m.current_price_quote.value,
+                ValueSource.ONCHAIN_STATE,
+                ctx.slot,
+                "SUSPECT: reserve pair is not on the curve",
             )
 
         if state.get("_truncated_fields"):
