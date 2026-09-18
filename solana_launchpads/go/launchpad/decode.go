@@ -88,6 +88,16 @@ func DecodeRaydiumLaunchlabGlobalConfig(data []byte, g *RaydiumLaunchlabGlobalCo
 	return g.decodeAt(data, discriminatorLen), nil
 }
 
+// DecodeRaydiumLaunchlabPlatformConfig fills pc from raw account bytes. There
+// is one of these per tenant (LetsBonk.fun, Cook.meme, ...), and it carries
+// only the fee split -- a pool prices correctly without it.
+func DecodeRaydiumLaunchlabPlatformConfig(data []byte, pc *RaydiumLaunchlabPlatformConfig) (string, error) {
+	if err := expect(RaydiumLaunchlabProgramID, data, KindRaydiumLaunchlabPlatformConfig, "Raydium LaunchLab PlatformConfig"); err != nil {
+		return "", err
+	}
+	return pc.decodeAt(data, discriminatorLen), nil
+}
+
 // DecodeMeteoraDbcVirtualPool fills p from raw account bytes.
 func DecodeMeteoraDbcVirtualPool(data []byte, p *MeteoraDbcVirtualPool) (string, error) {
 	if err := expect(MeteoraDbcProgramID, data, KindMeteoraDbcVirtualPool, "Meteora DBC VirtualPool"); err != nil {

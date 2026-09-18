@@ -14,6 +14,9 @@ import (
 // computes from them. This package is a port, and a port that disagrees with
 // its reference is worthless, so any divergence fails here.
 //
+// Because the vectors carry bytes rather than field values, they compare the
+// two layout compilers as well as the two sets of maths.
+//
 // Regenerate after changing either side:
 //
 //	python scripts/gen_golden.py && (cd go && go test ./...)
@@ -32,6 +35,8 @@ type goldenExpect struct {
 	Raised          float64  `json:"raised"`
 	ProgressValue   float64  `json:"progress"`
 	Complete        bool     `json:"complete"`
+	Migrated        bool     `json:"migrated"`
+	CurveType       string   `json:"curve_type"`
 	FeeBps          float64  `json:"fee_bps"`
 	Violations      []string `json:"violations"`
 	Truncated       bool     `json:"truncated"`
@@ -39,11 +44,13 @@ type goldenExpect struct {
 }
 
 type goldenCase struct {
-	Name      string       `json:"name"`
-	Note      string       `json:"note"`
-	GlobalHex string       `json:"global_hex"`
-	CurveHex  string       `json:"curve_hex"`
-	Expect    goldenExpect `json:"expect"`
+	Name          string       `json:"name"`
+	Note          string       `json:"note"`
+	ConfigHex     string       `json:"config_hex"`
+	PlatformHex   string       `json:"platform_hex"`
+	StateHex      string       `json:"state_hex"`
+	QuoteDecimals int          `json:"quote_decimals"`
+	Expect        goldenExpect `json:"expect"`
 }
 
 func loadGolden(t *testing.T) map[string][]goldenCase {
@@ -57,6 +64,15 @@ func loadGolden(t *testing.T) map[string][]goldenCase {
 		t.Fatalf("parsing golden vectors: %v", err)
 	}
 	return out
+}
+
+func goldenSection(t *testing.T, launchpad string) []goldenCase {
+	t.Helper()
+	cases := loadGolden(t)[launchpad]
+	if len(cases) == 0 {
+		t.Fatalf("no %s golden vectors; run scripts/gen_golden.py", launchpad)
+	}
+	return cases
 }
 
 func mustHex(t *testing.T, s string) []byte {
@@ -77,101 +93,142 @@ func closeEnough(got, want float64) bool {
 	return math.Abs(got-want)/math.Abs(want) < 1e-12
 }
 
-func TestGoldenVectorsMatchThePythonReference(t *testing.T) {
-	golden := loadGolden(t)
-	cases := golden["pumpfun"]
-	if len(cases) == 0 {
-		t.Fatal("no pump.fun golden vectors; run scripts/gen_golden.py")
+// compareMetrics asserts that one decoded Metrics matches what Python produced
+// from the same bytes.
+func compareMetrics(t *testing.T, got Metrics, want goldenExpect, truncatedAt string) {
+	t.Helper()
+
+	checks := []struct {
+		field string
+		got   float64
+		want  float64
+	}{
+		{"total_supply", got.TotalSupply, want.TotalSupply},
+		{"tokens_for_sale", got.TokensForSale, want.TokensForSale},
+		{"tokens_sold", got.TokensSold, want.TokensSold},
+		{"launch_price", got.LaunchPrice, want.LaunchPrice},
+		{"current_price", got.CurrentPrice, want.CurrentPrice},
+		{"graduation_price", got.GraduationPrice, want.GraduationPrice},
+		{"launch_mcap", got.LaunchMcap, want.LaunchMcap},
+		{"current_mcap", got.CurrentMcap, want.CurrentMcap},
+		{"graduation_mcap", got.GraduationMcap, want.GraduationMcap},
+		{"raise_target", got.RaiseTarget, want.RaiseTarget},
+		{"raised", got.Raised, want.Raised},
+		{"progress", got.Progress, want.ProgressValue},
+		{"fee_bps", got.FeeBps, want.FeeBps},
+	}
+	for _, c := range checks {
+		if !closeEnough(c.got, c.want) {
+			t.Errorf("%s: go %.17g, python %.17g", c.field, c.got, c.want)
+		}
 	}
 
-	for _, tc := range cases {
+	if got.Complete != want.Complete {
+		t.Errorf("complete: go %v, python %v", got.Complete, want.Complete)
+	}
+	if got.Migrated != want.Migrated {
+		t.Errorf("migrated: go %v, python %v", got.Migrated, want.Migrated)
+	}
+	if got.CurveType != want.CurveType {
+		t.Errorf("curve type: go %q, python %q", got.CurveType, want.CurveType)
+	}
+
+	var names []string
+	for _, v := range got.Violations {
+		names = append(names, v.Name)
+	}
+	sort.Strings(names)
+	wantNames := append([]string(nil), want.Violations...)
+	sort.Strings(wantNames)
+	if len(names) != len(wantNames) {
+		t.Fatalf("violations: go %v, python %v", names, wantNames)
+	}
+	for i := range names {
+		if names[i] != wantNames[i] {
+			t.Errorf("violations: go %v, python %v", names, wantNames)
+			break
+		}
+	}
+
+	if got.SuspectField != want.SuspectField {
+		t.Errorf("suspect field: go %q, python %q", got.SuspectField, want.SuspectField)
+	}
+	if (truncatedAt != "") != want.Truncated {
+		t.Errorf("truncation: go %q, python truncated=%v", truncatedAt, want.Truncated)
+	}
+}
+
+// decodePumpfunGolden rebuilds one pump.fun vector from its bytes.
+func decodePumpfunGolden(t *testing.T, tc goldenCase) (Metrics, string) {
+	t.Helper()
+	var g PumpfunGlobal
+	if _, err := DecodePumpfunGlobal(mustHex(t, tc.ConfigHex), &g); err != nil {
+		t.Fatalf("decoding Global: %v", err)
+	}
+	var curve PumpfunBondingCurve
+	truncatedAt, err := DecodePumpfunBondingCurve(mustHex(t, tc.StateHex), &curve)
+	if err != nil {
+		t.Fatalf("decoding BondingCurve: %v", err)
+	}
+	return NewPumpfunParams(&g, tc.QuoteDecimals).Metrics(&curve, truncatedAt), truncatedAt
+}
+
+func TestGoldenPumpfunMatchesThePythonReference(t *testing.T) {
+	for _, tc := range goldenSection(t, "pumpfun") {
 		t.Run(tc.Name, func(t *testing.T) {
-			var g PumpfunGlobal
-			if _, err := DecodePumpfunGlobal(mustHex(t, tc.GlobalHex), &g); err != nil {
-				t.Fatalf("decoding Global: %v", err)
-			}
-			params := NewPumpfunParams(&g, 9)
+			got, truncatedAt := decodePumpfunGolden(t, tc)
+			compareMetrics(t, got, tc.Expect, truncatedAt)
+		})
+	}
+}
 
-			var curve PumpfunBondingCurve
-			truncatedAt, err := DecodePumpfunBondingCurve(mustHex(t, tc.CurveHex), &curve)
+func TestGoldenRaydiumLaunchlabMatchesThePythonReference(t *testing.T) {
+	for _, tc := range goldenSection(t, "raydium_launchlab") {
+		t.Run(tc.Name, func(t *testing.T) {
+			var g RaydiumLaunchlabGlobalConfig
+			if _, err := DecodeRaydiumLaunchlabGlobalConfig(mustHex(t, tc.ConfigHex), &g); err != nil {
+				t.Fatalf("decoding GlobalConfig: %v", err)
+			}
+			var pc RaydiumLaunchlabPlatformConfig
+			if _, err := DecodeRaydiumLaunchlabPlatformConfig(mustHex(t, tc.PlatformHex), &pc); err != nil {
+				t.Fatalf("decoding PlatformConfig: %v", err)
+			}
+			var pool RaydiumLaunchlabPoolState
+			truncatedAt, err := DecodeRaydiumLaunchlabPoolState(mustHex(t, tc.StateHex), &pool)
 			if err != nil {
-				t.Fatalf("decoding BondingCurve: %v", err)
+				t.Fatalf("decoding PoolState: %v", err)
 			}
-			got := params.Metrics(&curve, truncatedAt)
+			params := NewRaydiumLaunchlabParams(&g).WithPlatform(&pc)
+			compareMetrics(t, params.Metrics(&pool, truncatedAt), tc.Expect, truncatedAt)
+		})
+	}
+}
 
-			checks := []struct {
-				field string
-				got   float64
-				want  float64
-			}{
-				{"total_supply", got.TotalSupply, tc.Expect.TotalSupply},
-				{"tokens_for_sale", got.TokensForSale, tc.Expect.TokensForSale},
-				{"tokens_sold", got.TokensSold, tc.Expect.TokensSold},
-				{"launch_price", got.LaunchPrice, tc.Expect.LaunchPrice},
-				{"current_price", got.CurrentPrice, tc.Expect.CurrentPrice},
-				{"graduation_price", got.GraduationPrice, tc.Expect.GraduationPrice},
-				{"launch_mcap", got.LaunchMcap, tc.Expect.LaunchMcap},
-				{"current_mcap", got.CurrentMcap, tc.Expect.CurrentMcap},
-				{"graduation_mcap", got.GraduationMcap, tc.Expect.GraduationMcap},
-				{"raise_target", got.RaiseTarget, tc.Expect.RaiseTarget},
-				{"raised", got.Raised, tc.Expect.Raised},
-				{"progress", got.Progress, tc.Expect.ProgressValue},
-				{"fee_bps", got.FeeBps, tc.Expect.FeeBps},
+func TestGoldenMeteoraDbcMatchesThePythonReference(t *testing.T) {
+	for _, tc := range goldenSection(t, "meteora_dbc") {
+		t.Run(tc.Name, func(t *testing.T) {
+			var cfg MeteoraDbcPoolConfig
+			if _, err := DecodeMeteoraDbcPoolConfig(mustHex(t, tc.ConfigHex), &cfg); err != nil {
+				t.Fatalf("decoding PoolConfig: %v", err)
 			}
-			for _, c := range checks {
-				if !closeEnough(c.got, c.want) {
-					t.Errorf("%s: go %.17g, python %.17g", c.field, c.got, c.want)
-				}
+			var pool MeteoraDbcVirtualPool
+			truncatedAt, err := DecodeMeteoraDbcVirtualPool(mustHex(t, tc.StateHex), &pool)
+			if err != nil {
+				t.Fatalf("decoding VirtualPool: %v", err)
 			}
-
-			if got.Complete != tc.Expect.Complete {
-				t.Errorf("complete: go %v, python %v", got.Complete, tc.Expect.Complete)
-			}
-
-			var names []string
-			for _, v := range got.Violations {
-				names = append(names, v.Name)
-			}
-			sort.Strings(names)
-			want := append([]string(nil), tc.Expect.Violations...)
-			sort.Strings(want)
-			if len(names) != len(want) {
-				t.Fatalf("violations: go %v, python %v", names, want)
-			}
-			for i := range names {
-				if names[i] != want[i] {
-					t.Errorf("violations: go %v, python %v", names, want)
-					break
-				}
-			}
-
-			if got.SuspectField != tc.Expect.SuspectField {
-				t.Errorf("suspect field: go %q, python %q", got.SuspectField, tc.Expect.SuspectField)
-			}
-			if (truncatedAt != "") != tc.Expect.Truncated {
-				t.Errorf("truncation: go %q, python truncated=%v", truncatedAt, tc.Expect.Truncated)
-			}
+			params := NewMeteoraDbcParams(&cfg, tc.QuoteDecimals)
+			compareMetrics(t, params.Metrics(&pool, truncatedAt), tc.Expect, truncatedAt)
 		})
 	}
 }
 
 func TestGoldenAnomalyIsRejected(t *testing.T) {
 	// The production row must not be published as a price, in either language.
-	golden := loadGolden(t)
-	for _, tc := range golden["pumpfun"] {
+	for _, tc := range goldenSection(t, "pumpfun") {
 		if tc.Name != "field_mixing_anomaly" {
 			continue
 		}
-		var g PumpfunGlobal
-		if _, err := DecodePumpfunGlobal(mustHex(t, tc.GlobalHex), &g); err != nil {
-			t.Fatal(err)
-		}
-		var curve PumpfunBondingCurve
-		truncatedAt, err := DecodePumpfunBondingCurve(mustHex(t, tc.CurveHex), &curve)
-		if err != nil {
-			t.Fatal(err)
-		}
-		m := NewPumpfunParams(&g, 9).Metrics(&curve, truncatedAt)
+		m, _ := decodePumpfunGolden(t, tc)
 		if m.OK() {
 			t.Fatal("the k-violating pair should not report OK")
 		}
@@ -187,21 +244,11 @@ func TestGoldenAnomalyIsRejected(t *testing.T) {
 }
 
 func TestGoldenHealthyCurvesAreOK(t *testing.T) {
-	golden := loadGolden(t)
-	for _, tc := range golden["pumpfun"] {
+	for _, tc := range goldenSection(t, "pumpfun") {
 		if tc.Name == "field_mixing_anomaly" {
 			continue
 		}
-		var g PumpfunGlobal
-		if _, err := DecodePumpfunGlobal(mustHex(t, tc.GlobalHex), &g); err != nil {
-			t.Fatal(err)
-		}
-		var curve PumpfunBondingCurve
-		truncatedAt, err := DecodePumpfunBondingCurve(mustHex(t, tc.CurveHex), &curve)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if m := NewPumpfunParams(&g, 9).Metrics(&curve, truncatedAt); !m.OK() {
+		if m, _ := decodePumpfunGolden(t, tc); !m.OK() {
 			t.Errorf("%s: unexpected violations %v", tc.Name, m.Violations)
 		}
 	}

@@ -171,17 +171,20 @@ docs/
 scripts/
   launchpads.py             CLI
   live_node_example.py      live-feed wiring
-tests/                      139 tests, no network
+tests/                      168 tests, no network
 ```
 
 ## Go
 
 `go/` is a production port: the decode path and curve maths in Go, standard
-library only, 134 ns and zero allocations per curve. Its account layouts are
-*generated* from the same IDL snapshots (`python scripts/gen_go.py`), and
+library only, ~150 ns and zero allocations per curve. Account layouts for all
+eight launchpads are *generated* from the same IDL snapshots (`python
+scripts/gen_go.py`), and metrics adapters are written for pump.fun, Raydium
+LaunchLab and Meteora DBC.
+
 `go/launchpad/testdata/golden.json` holds account bytes plus the numbers this
 Python implementation produces from them, which the Go test suite asserts it
-reproduces to 1e-12. See `go/README.md`.
+reproduces to 1e-12 across all three adapters. See `go/README.md`.
 
 Research tooling — triage, row auditing, selftest, upgrade watching — stays
 here and runs out of band.
@@ -190,8 +193,8 @@ here and runs out of band.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q     # 159, offline
-(cd go && go test ./...)       # 25, offline
+python -m pytest tests/ -q     # 168, offline
+(cd go && go test ./...)       # 52, offline
 ```
 
 They run entirely offline against synthetic, byte-exact fixtures built by a

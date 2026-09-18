@@ -4,7 +4,7 @@ Production port of the Python reference implementation in the parent directory.
 Decodes Solana bonding-curve launch state into prices, supply, market caps and
 raise targets.
 
-Standard library only. **134 ns and zero allocations** to decode a curve and
+Standard library only. **~150 ns and zero allocations** to decode a curve and
 price it.
 
 ```go
@@ -26,6 +26,25 @@ m.RaiseTarget      // 85.005359057 SOL
 m.GraduationMcap   // 410.88016812075745 SOL
 m.OK()             // false if the reserve pair failed its invariant
 ```
+
+Raydium LaunchLab and Meteora DBC follow the same shape — build a `Params` once
+per config account, then call `Metrics` per pool:
+
+```go
+// Raydium LaunchLab: GlobalConfig says which curve maths applies,
+// PlatformConfig carries the tenant's fee split (optional; prices are
+// correct without it, only the fee is understated).
+params := launchpad.NewRaydiumLaunchlabParams(&globalConfig).WithPlatform(&platformConfig)
+m := params.Metrics(&poolState, truncatedAt)
+
+// Meteora DBC: one PoolConfig serves a whole launchpad's coins.
+params := launchpad.NewMeteoraDbcParams(&poolConfig, 9)
+m := params.Metrics(&virtualPool, truncatedAt)
+```
+
+`Params` is the cacheable half. Everything that costs real work — LaunchLab's
+128-bit raise target, DBC's 20-segment curve walk — happens once there; `Metrics`
+then reads direct fields only.
 
 ## Scope
 
@@ -66,12 +85,32 @@ reference is worthless, so divergence fails the build.
 
 Regenerate with `python scripts/gen_golden.py`.
 
-The vectors cover a fresh curve, mid-curve, a completed curve, a legacy
-truncated account, and the field-mixing anomaly measured in production — the
-last of which must come back `OK() == false` with `SuspectField ==
-"virtual_quote"` in both languages.
+Sixteen vectors across the three adapters:
 
-## The invariant check
+| launchpad | vectors |
+|---|---|
+| pump.fun | fresh, mid-curve, completed, legacy truncated account, both quote variants, and the field-mixing anomaly measured in production |
+| Raydium LaunchLab | constant-product fresh/mid/migrated, fixed price, linear half sold |
+| Meteora DBC | fresh, mid, migrated, and a two-segment config with `migration_sqrt_price` left at zero |
+
+Because the vectors carry *bytes* rather than field values, they compare the two
+layout compilers as well as the two sets of maths. The anomaly vector must come
+back `OK() == false` with `SuspectField == "virtual_quote"` in both languages,
+and the DBC segment vector forces both sides to walk the curve and land on the
+same sqrt price.
+
+## The invariant checks
+
+Each adapter carries the strongest self-consistency test its program admits.
+None of them needs a second data source: a wrong row is caught by the row
+itself.
+
+| check | launchpad | what it catches |
+|---|---|---|
+| `CheckConstantProductPair` | pump.fun, LaunchLab | a reserve pair that is not on its own k |
+| `CheckReserveOffset` | pump.fun | `virtual_quote - real_quote` matching no opening constant |
+| `CheckLaunchLabConstantProduct` | LaunchLab | real and virtual reserves from different reads |
+| `CheckDbcSqrtPrice` | Meteora DBC | a pool priced outside the band its config allows |
 
 `CheckConstantProductPair` tests whether a reserve pair actually lies on the
 curve it claims to be on. `vBase*vQuote` is invariant; flooring moves it *up* by
@@ -94,19 +133,30 @@ apart.
 ## Tests
 
 ```sh
-go test ./...                              # 25 tests
-go test -run=XXX -bench=. -benchmem ./...  # 134 ns/op, 0 allocs/op
+go test ./...                              # 52 tests
+go test -run=XXX -bench=. -benchmem ./...  # 0 allocs/op on every adapter
 ```
 
-The allocation budget is asserted, not just measured: `TestDecodingACurveDoesNotAllocate`
-and `TestPricingAHealthyCurveDoesNotAllocate` fail if either path starts
-allocating.
+```
+BenchmarkDbcPrice-4         102.4 ns/op   0 B/op   0 allocs/op
+BenchmarkLaunchLabPrice-4   124.9 ns/op   0 B/op   0 allocs/op
+BenchmarkDecodeAndPrice-4   154.2 ns/op   0 B/op   0 allocs/op
+```
+
+The allocation budget is asserted, not just measured: `TestDecodingACurveDoesNotAllocate`,
+`TestPricingAHealthyCurveDoesNotAllocate`, `TestPricingALaunchLabPoolDoesNotAllocate`
+and `TestPricingADbcPoolDoesNotAllocate` fail if any path starts allocating.
 
 ## Coverage
 
 Generated layouts exist for every launchpad in the registry — pump.fun,
 PumpSwap, Raydium LaunchLab, Meteora DBC, Moonit, Heaven, Vertigo, GoFundMeme —
-so their accounts decode today. Metrics adapters are currently written for
-pump.fun; the others decode to typed structs and need their curve maths wired
-up the same way, which is a small job per launchpad given `curves.go` already
-carries the maths. See `docs/CURVE_MATH.md` for the derivations.
+so all of their accounts decode to typed structs today.
+
+Metrics adapters — the maths that turns a decoded account into prices, supply,
+market cap and a raise target — are written for **pump.fun, Raydium LaunchLab
+and Meteora DBC**, which between them cover the great majority of curve volume.
+The remaining five (Moonit, Heaven, Vertigo, GoFundMeme, PumpSwap) decode but do
+not yet price on the Go side; the Python reference prices all eight, and
+`curves.go` already carries their maths, so each is roughly one file. See
+`docs/CURVE_MATH.md` for the derivations.
