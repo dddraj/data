@@ -174,11 +174,24 @@ scripts/
 tests/                      139 tests, no network
 ```
 
+## Go
+
+`go/` is a production port: the decode path and curve maths in Go, standard
+library only, 134 ns and zero allocations per curve. Its account layouts are
+*generated* from the same IDL snapshots (`python scripts/gen_go.py`), and
+`go/launchpad/testdata/golden.json` holds account bytes plus the numbers this
+Python implementation produces from them, which the Go test suite asserts it
+reproduces to 1e-12. See `go/README.md`.
+
+Research tooling — triage, row auditing, selftest, upgrade watching — stays
+here and runs out of band.
+
 ## Tests
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q
+python -m pytest tests/ -q     # 159, offline
+(cd go && go test ./...)       # 25, offline
 ```
 
 They run entirely offline against synthetic, byte-exact fixtures built by a
