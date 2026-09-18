@@ -90,6 +90,26 @@ class StructLayout:
 
     name: str
     fields: List[Tuple[str, Decoder]]
+    #: byte offset of each field *within the struct body*, for every field
+    #: reachable without crossing a variable-length one.  Add
+    #: `DISCRIMINATOR_LEN` to get the offset within the account, which is what
+    #: an RPC `memcmp` filter wants.
+    offsets: Dict[str, int] = field(default_factory=dict)
+    #: byte width of each field, or None where it is variable-length
+    sizes: Dict[str, Optional[int]] = field(default_factory=dict)
+
+    def memcmp_offset(self, field_name: str) -> Optional[int]:
+        """Offset of `field_name` within the raw account, or None if unknowable."""
+        body_offset = self.offsets.get(field_name)
+        return None if body_offset is None else DISCRIMINATOR_LEN + body_offset
+
+    def pubkey_fields(self) -> List[str]:
+        """Fields that are 32 bytes wide and sit at a known offset."""
+        return [
+            name
+            for name, _decoder in self.fields
+            if self.sizes.get(name) == 32 and name in self.offsets
+        ]
 
     def decode(self, reader: BorshReader) -> Dict[str, Any]:
         out: Dict[str, Any] = {}
@@ -130,6 +150,102 @@ class StructLayout:
         return self.decode_prefix(BorshReader(data, offset))
 
 
+#: byte width of every fixed-size primitive
+_PRIMITIVE_SIZES: Dict[str, int] = {
+    "bool": 1,
+    "u8": 1,
+    "i8": 1,
+    "u16": 2,
+    "i16": 2,
+    "u32": 4,
+    "i32": 4,
+    "f32": 4,
+    "u64": 8,
+    "i64": 8,
+    "f64": 8,
+    "u128": 16,
+    "i128": 16,
+    "u256": 32,
+    "i256": 32,
+    "publickey": 32,
+    "pubkey": 32,
+}
+
+
+def fixed_size(node: Any, types: Dict[str, dict], _seen: Optional[set] = None) -> Optional[int]:
+    """Byte width of an IDL type, or None when it is variable-length.
+
+    Borsh lays fields out back to back with no padding, so summing these gives
+    the exact offset of a field -- which is what lets the decoder turn "find
+    the curve account for this mint" into a server-side `memcmp` instead of a
+    full program scan.
+    """
+    _seen = _seen or set()
+    if isinstance(node, str):
+        return _PRIMITIVE_SIZES.get(node.lower())
+    if not isinstance(node, dict):
+        return None
+    if "array" in node:
+        inner, count = node["array"]
+        if not isinstance(count, int):
+            return None
+        inner_size = fixed_size(inner, types, _seen)
+        return None if inner_size is None else inner_size * count
+    if "defined" in node:
+        ref = node["defined"]
+        name = ref if isinstance(ref, str) else ref.get("name")
+        if not name or name in _seen:
+            return None
+        body = (types.get(name) or {}).get("type")
+        if not body:
+            return None
+        if body.get("kind") == "struct":
+            return _struct_size(body.get("fields") or [], types, _seen | {name})
+        if body.get("kind") == "enum":
+            variants = body.get("variants") or []
+            # A C-like enum is one byte; a data-carrying one is not fixed width.
+            return 1 if variants and not any(v.get("fields") for v in variants) else None
+        return None
+    # vec / string / bytes / option / coption are all variable-length
+    return None
+
+
+def _struct_size(fields: List[Any], types: Dict[str, dict], seen: set) -> Optional[int]:
+    total = 0
+    for f in fields:
+        node = f["type"] if isinstance(f, dict) else f
+        size = fixed_size(node, types, seen)
+        if size is None:
+            return None
+        total += size
+    return total
+
+
+def field_offsets(
+    fields: List[Any], types: Dict[str, dict]
+) -> Tuple[Dict[str, int], Dict[str, Optional[int]]]:
+    """Offsets and widths of a struct's fields.
+
+    Offsets stop at the first variable-length field, since everything after it
+    has no fixed offset; widths are reported for every field either way.
+    """
+    offsets: Dict[str, int] = {}
+    sizes: Dict[str, Optional[int]] = {}
+    cursor: Optional[int] = 0
+    for idx, f in enumerate(fields):
+        if isinstance(f, dict):
+            name = to_snake(f.get("name") or f"field_{idx}")
+            node = f["type"]
+        else:
+            name, node = f"field_{idx}", f
+        size = fixed_size(node, types)
+        sizes[name] = size
+        if cursor is not None:
+            offsets[name] = cursor
+            cursor = None if size is None else cursor + size
+    return offsets, sizes
+
+
 class _TypeCompiler:
     """Compiles IDL type nodes into closures, resolving `defined` lazily."""
 
@@ -146,7 +262,9 @@ class _TypeCompiler:
         type_node = node.get("type", node)
         if type_node.get("kind") != "struct":
             raise IdlError(f"type {name!r} is not a struct")
-        return StructLayout(name, self._compile_struct_fields(type_node.get("fields") or []))
+        fields = type_node.get("fields") or []
+        offsets, sizes = field_offsets(fields, self._nodes)
+        return StructLayout(name, self._compile_struct_fields(fields), offsets, sizes)
 
     def compile(self, node: Any) -> Decoder:
         if isinstance(node, str):

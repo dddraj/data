@@ -74,8 +74,43 @@ python scripts/launchpads.py platforms raydium_launchlab
 ```
 
 And a launchpad nobody has written an adapter for still decodes, as long as it
-publishes an Anchor IDL on chain — the heuristic adapter maps field names to
-curve roles and reports a confidence score.
+publishes an Anchor IDL on chain — the decoder adopts the program at runtime
+and the heuristic adapter maps field names to curve roles, with a confidence
+score attached.
+
+## Coins with no pool row
+
+If a launchpad table is learned from curves that already have pool rows, a
+launchpad whose coins produced none can never enter it, and those coins can
+never be priced. Nothing here reads pool rows — the entry point is the
+`creator_program` the coins already carry.
+
+```bash
+python scripts/launchpads.py triage unpriced.csv   # program_id,coin_count
+```
+
+```
+ coins  verdict           conf  program
+    21  self_describing   0.75  EYLAenNyYN8q…  decodable now via its on-chain IDL
+     7  no_curve_shape    0.00  6iQpPpj844Df…  publishes an IDL but nothing curve-shaped
+     3  opaque            0.00  DEHbmbzAkALd…  no on-chain IDL: needs an SDK or reverse engineering
+     1  not_a_program     0.00  6vAwn1hPHPhN…  not executable — check how creator_program was populated
+```
+
+Then, for the ones that are reachable, mint → price without an index:
+
+```bash
+python scripts/launchpads.py find-curve <creator_program> <mint> --price
+```
+
+```python
+from launchpad_decoder.discovery import price_mint
+metrics = price_mint(decoder, creator_program, mint)
+```
+
+Programs in the `opaque` bucket stay NULL — the point is to say which ones
+those are and how many coins each is holding up, not to manufacture a number.
+See `docs/PROGRAM_LEVEL_DECODING.md` §6b.
 
 ## CLI
 
@@ -88,6 +123,8 @@ python scripts/launchpads.py params pumpfun        # live launch params + proven
 python scripts/launchpads.py decode <address>      # one curve
 python scripts/launchpads.py platforms meteora_dbc # every DBC launchpad
 python scripts/launchpads.py idl-status            # who publishes an IDL on chain
+python scripts/launchpads.py triage unpriced.csv   # classify unknown creator programs
+python scripts/launchpads.py find-curve <prog> <mint> --price
 python scripts/launchpads.py deployments           # deploy slot + upgrade authority
 python scripts/launchpads.py watch --interval 60   # log upgrades and param changes
 ```
@@ -122,6 +159,7 @@ launchpad_decoder/
   rpc.py            AccountSource protocol + JSON-RPC and static implementations
   program_state.py  upgradeable-loader parsing, ProgramWatcher, on-chain IDL loader
   registry.py       launchpad registry + platform discovery metadata
+  discovery.py      triage unknown creator programs; mint -> curve with no index
   decoder.py        the façade
   adapters/         one per launchpad, plus the heuristic fallback
   idl/              bundled IDL snapshots
@@ -132,7 +170,7 @@ docs/
 scripts/
   launchpads.py             CLI
   live_node_example.py      live-feed wiring
-tests/                      96 tests, no network
+tests/                      109 tests, no network
 ```
 
 ## Tests

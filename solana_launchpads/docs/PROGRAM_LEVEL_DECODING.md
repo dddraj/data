@@ -204,6 +204,95 @@ novel scores low and says so, rather than emitting a confident wrong number.
 
 ---
 
+## 6b. Coins with no pool row
+
+There is a specific failure mode worth naming, because it is self-sustaining.
+
+If the launchpad table is *learned from curves that already have pool rows*,
+then a launchpad whose coins produced no pool rows can never enter the table,
+and its coins can never be priced. No pool row → no launchpad → no pool row.
+The coins look like a data-quality problem; they are a bootstrap problem, and
+no amount of reprocessing the same rows will fix it.
+
+Nothing here reads pool rows. The entry point is the **creator program**, which
+those coins already have.
+
+### Triage: a few programs, or a long tail?
+
+`SELECT creator_program, count(*) ... GROUP BY 1` answers the cardinality.
+What it cannot tell you is whether a price is *reachable* for each one. That is
+`triage_programs`:
+
+```bash
+python scripts/launchpads.py triage unpriced.csv     # program_id,coin_count
+```
+
+```
+ coins  verdict           conf  program
+    21  self_describing   0.75  EYLAenNyYN8q…  decodable now via its on-chain IDL
+     7  no_curve_shape    0.00  6iQpPpj844Df…  publishes an IDL but nothing curve-shaped
+     3  opaque            0.00  DEHbmbzAkALd…  no on-chain IDL: needs an SDK or reverse engineering
+     1  not_a_program     0.00  6vAwn1hPHPhN…  not executable — check how creator_program was populated
+```
+
+Five verdicts, each a different piece of work:
+
+| Verdict | What it means | What to do |
+|---|---|---|
+| `known_launchpad` | already in the registry | decode it |
+| `self_describing` | publishes an Anchor IDL with curve-shaped accounts | confirm on a sample, then backfill |
+| `no_curve_shape` | has an IDL, but no bonding-curve account | probably not a launchpad — check the column |
+| `opaque` | no on-chain IDL | needs an SDK, a published IDL, or reverse engineering |
+| `not_a_program` | the account is not executable | `creator_program` was populated from the wrong key |
+
+The summary line is the answer to "head or tail": how many programs, how many
+coins, and how many of those coins are decodable today.
+
+### From a mint to a price, with no pool row
+
+```python
+from launchpad_decoder.discovery import price_mint
+metrics = price_mint(decoder, creator_program, mint)
+```
+
+Two routes, cheapest first:
+
+1. **PDA derivation**, for launchpads that derive the curve address from the
+   mint. pump.fun is the case that matters: its `BondingCurve` stores no base
+   mint at all, so a memcmp search can never find it — only the PDA can.
+2. **A server-side `memcmp`** at the exact byte offset the program's own
+   layout puts a mint field at. `field_offsets()` computes it from the IDL, so
+   this is one filtered `getProgramAccounts` per candidate field, not a scan.
+
+### The registry is a head start, not a gate
+
+`LaunchpadDecoder` adopts an unregistered program that publishes an on-chain
+IDL, the first time it sees an account from it:
+
+```python
+decoder.decode_account_data(owner=some_unknown_program, data=..., address=...)
+# -> LaunchMetrics(launchpad="learned:bigpad", ...)
+
+decoder.learned_programs   # programs adopted at runtime
+decoder.unlearnable        # and the ones that could not be, with the reason
+```
+
+Pass `auto_learn=False` to require an explicit registry entry.
+
+This is the part that actually breaks the cycle: the table is populated from
+what the *program* says about itself, not from rows the program's coins
+happened to produce.
+
+### What stays NULL
+
+A program in the `opaque` bucket has no reachable price, and the right value is
+still NULL. Nothing here manufactures an opening price from a program that will
+not describe itself — it reports which programs those are and how many coins
+each one is holding up, so the decision to spend time on one is made against a
+number rather than a hunch.
+
+---
+
 ## 7. Transport independence
 
 Everything goes through the `AccountSource` protocol:

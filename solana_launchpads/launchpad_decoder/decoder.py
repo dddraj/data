@@ -38,7 +38,7 @@ from .registry import (
     get as get_spec,
 )
 from .rpc import AccountInfo, AccountSource
-from .types import LaunchMetrics
+from .types import CurveFamily, LaunchMetrics
 
 
 @dataclass
@@ -76,8 +76,12 @@ class LaunchpadDecoder:
         prefer_onchain_idl: bool = True,
         hash_executables: bool = False,
         resolve_mints: bool = True,
+        auto_learn: bool = True,
     ) -> None:
         self.source = source
+        #: adopt unregistered programs that publish an on-chain IDL, so a
+        #: launchpad nobody has catalogued can still be decoded
+        self.auto_learn = auto_learn
         self.specs: Dict[str, LaunchpadSpec] = {spec.program_id: spec for spec in launchpads}
         self.by_key: Dict[str, LaunchpadSpec] = {spec.key: spec for spec in launchpads}
         self.prefer_onchain_idl = prefer_onchain_idl and source is not None
@@ -95,6 +99,76 @@ class LaunchpadDecoder:
         self._bundled: Dict[str, Optional[ProgramSchema]] = {}
         self._static_snapshot: Dict[str, Dict[str, Any]] = {}
         self._mint_decimals: Dict[str, int] = {}
+        self._learned: Dict[str, LaunchpadSpec] = {}
+        self._unlearnable: Dict[str, str] = {}
+
+    # ------------------------------------------------------------------
+    # adopting a launchpad nobody catalogued
+    # ------------------------------------------------------------------
+    def learn_program(self, program_id: str) -> Optional[LaunchpadSpec]:
+        """Adopt an unregistered program that publishes its own IDL.
+
+        This is what stops the launchpad table from having to be seeded by the
+        very rows it is supposed to explain. A creator program nothing has
+        catalogued is asked directly what its accounts look like; if it
+        answers, it becomes decodable immediately.
+
+        Returns the synthesised spec, or None when the program publishes no
+        usable IDL (in which case `unlearnable` records why).
+        """
+        if program_id in self.specs:
+            return self.specs[program_id]
+        if self.source is None or program_id in self._unlearnable:
+            return None
+
+        try:
+            onchain = fetch_onchain_idl(self.source, program_id)
+        except Exception as exc:  # noqa: BLE001 - a bad IDL is a finding
+            self._unlearnable[program_id] = f"on-chain IDL unusable: {exc}"
+            return None
+        if onchain is None:
+            self._unlearnable[program_id] = "no IDL account at the canonical address"
+            return None
+
+        schema = onchain.compile()
+        base_key = schema.name if schema.name != "unknown" else program_id[:8]
+        key = f"learned:{base_key}"
+        suffix = 2
+        while key in self.by_key:
+            key = f"learned:{base_key}-{suffix}"
+            suffix += 1
+
+        spec = LaunchpadSpec(
+            key=key,
+            display_name=f"{base_key} (learned from its on-chain IDL)",
+            program_id=program_id,
+            curve_family=CurveFamily.UNKNOWN,
+            state_account="",  # the heuristic adapter ranks the candidates
+            adapter="heuristic",
+            requires_onchain_idl=True,
+            notes="adopted at runtime; no hand-written adapter",
+        )
+        self.specs[program_id] = spec
+        self.by_key[key] = spec
+        self._learned[program_id] = spec
+        self.watcher.track(program_id)
+        return spec
+
+    def _spec_for(self, program_id: str) -> Optional[LaunchpadSpec]:
+        spec = self.specs.get(program_id)
+        if spec is not None:
+            return spec
+        return self.learn_program(program_id) if self.auto_learn else None
+
+    @property
+    def learned_programs(self) -> Dict[str, LaunchpadSpec]:
+        """Programs adopted at runtime rather than shipped in the registry."""
+        return dict(self._learned)
+
+    @property
+    def unlearnable(self) -> Dict[str, str]:
+        """Programs that could not be adopted, and why."""
+        return dict(self._unlearnable)
 
     # ------------------------------------------------------------------
     # schemas
@@ -136,7 +210,7 @@ class LaunchpadDecoder:
         slot: int = 0,
     ) -> Optional[LaunchMetrics]:
         """Decode raw bytes owned by `program_id`. Returns None if not a curve."""
-        spec = self.specs.get(program_id)
+        spec = self._spec_for(program_id)
         if spec is None:
             return None
         schema = self.schema(program_id)
@@ -169,7 +243,7 @@ class LaunchpadDecoder:
 
     def classify(self, account: AccountInfo) -> Optional[Tuple[str, str]]:
         """``(launchpad key, account type)`` for any account, curve or not."""
-        spec = self.specs.get(account.owner)
+        spec = self._spec_for(account.owner)
         if spec is None:
             return None
         schema = self.schema(account.owner)

@@ -18,6 +18,8 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Protocol, Sequence
 
+from .base58 import b58decode
+
 
 @dataclass(frozen=True)
 class AccountInfo:
@@ -192,8 +194,24 @@ class StaticAccountSource:
     def add(self, account: AccountInfo) -> None:
         self._accounts[account.pubkey] = account
 
-    def add_raw(self, pubkey: str, owner: str, data: bytes, lamports: int = 0) -> None:
-        self.add(AccountInfo(pubkey=pubkey, owner=owner, lamports=lamports, data=data, slot=self._slot))
+    def add_raw(
+        self,
+        pubkey: str,
+        owner: str,
+        data: bytes,
+        lamports: int = 0,
+        executable: bool = False,
+    ) -> None:
+        self.add(
+            AccountInfo(
+                pubkey=pubkey,
+                owner=owner,
+                lamports=lamports,
+                data=data,
+                executable=executable,
+                slot=self._slot,
+            )
+        )
 
     def get_account(self, pubkey: str) -> Optional[AccountInfo]:
         return self._accounts.get(pubkey)
@@ -214,6 +232,13 @@ class StaticAccountSource:
         )
         if data_size is not None:
             rows = (a for a in rows if a.size == data_size)
+        for offset, blob in memcmp or ():
+            expected = b58decode(blob)
+            rows = [
+                a
+                for a in rows
+                if a.data[offset : offset + len(expected)] == expected
+            ]
         out = list(rows)
         return out[:limit] if limit else out
 

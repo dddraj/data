@@ -187,6 +187,115 @@ def cmd_scan(args) -> None:
         )
 
 
+def _read_addresses(path: str) -> "list[tuple[str, int]]":
+    """Read `program_id[,count]` per line, from a file or '-' for stdin.
+
+    The optional count is how many unpriced coins that program accounts for --
+    `SELECT creator_program, count(*) ... GROUP BY 1` dumped to CSV works
+    as-is, header or not.
+    """
+    handle = sys.stdin if path == "-" else open(path, encoding="utf-8")
+    rows = []
+    try:
+        for line in handle:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = [p.strip().strip('"') for p in line.replace("\t", ",").split(",")]
+            program = parts[0]
+            count = 0
+            if len(parts) > 1:
+                try:
+                    count = int(parts[1])
+                except ValueError:
+                    count = 0
+            if program.lower() in ("creator_program", "program", "program_id"):
+                continue  # CSV header
+            rows.append((program, count))
+    finally:
+        if handle is not sys.stdin:
+            handle.close()
+    return rows
+
+
+def cmd_triage(args) -> None:
+    """Classify unknown creator programs: which are worth deriving, which are tail."""
+    from launchpad_decoder.discovery import summarise_triage, triage_programs
+
+    decoder = make_decoder(args)
+    rows = _read_addresses(args.programs)
+    counts = {program: count for program, count in rows if count}
+    results = triage_programs(decoder, [p for p, _ in rows], coin_counts=counts)
+
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "summary": summarise_triage(results),
+                    "programs": [r.as_dict() for r in results],
+                },
+                indent=2,
+                default=str,
+            )
+        )
+        return
+
+    print(f"{'coins':>6}  {'verdict':16} {'conf':>5}  {'curve family':26} program")
+    print("-" * 118)
+    for entry in results:
+        print(
+            f"{entry.coin_count:>6}  {entry.verdict:16} "
+            f"{entry.best_confidence:>5.2f}  {entry.curve_family:26} {entry.program_id}"
+        )
+        detail = entry.launchpad_key or entry.idl_name
+        if detail:
+            print(f"{'':>6}  -> {detail} {entry.idl_version}".rstrip())
+        if entry.curve_accounts:
+            print(f"{'':>6}  -> curve accounts: {', '.join(entry.curve_accounts[:4])}")
+        if entry.note:
+            print(f"{'':>6}  -> {entry.note}")
+        print(f"{'':>6}  -> {entry.action}")
+
+    summary = summarise_triage(results)
+    print("\nsummary")
+    print(f"  programs          : {summary['programs_total']}")
+    print(f"  coins             : {summary['coins_total']}")
+    print(
+        f"  decodable now     : {summary['programs_decodable']} programs "
+        f"/ {summary['coins_decodable']} coins"
+    )
+    for verdict, count in sorted(summary["programs"].items()):
+        print(f"    {verdict:18} {count:>3} programs, {summary['coins'].get(verdict, 0):>4} coins")
+
+
+def cmd_find_curve(args) -> None:
+    """Locate (and optionally price) a mint's curve account with no pool row."""
+    from launchpad_decoder.discovery import find_state_accounts_for_mint
+
+    decoder = make_decoder(args)
+    candidates = find_state_accounts_for_mint(decoder, args.program, args.mint)
+    if not candidates:
+        print(f"no account of {args.program} references mint {args.mint}")
+        return
+    for candidate in candidates:
+        print(
+            f"{candidate.address}  {candidate.account_type}  "
+            f"(matched {candidate.matched_field} at byte {candidate.memcmp_offset})"
+        )
+        if not args.price:
+            continue
+        metrics = decoder.decode_address(candidate.address)
+        if metrics is None:
+            print("    not decodable as curve state")
+            continue
+        print(
+            f"    launch {fmt(metrics.launch_price_quote.value)}"
+            f"  now {fmt(metrics.current_price_quote.value)}"
+            f"  supply {fmt(metrics.total_supply.value)}"
+            f"  target {fmt(metrics.raise_target_quote.value)}"
+        )
+
+
 def cmd_idl_status(args) -> None:
     decoder = make_decoder(args)
     for key, status in sorted(decoder.onchain_idl_status().items()):
@@ -254,6 +363,25 @@ def main() -> None:
     p.add_argument("launchpad")
     p.add_argument("--limit", type=int, default=25)
     p.set_defaults(func=cmd_scan, needs_rpc=True)
+
+    p = sub.add_parser(
+        "triage",
+        help="classify unknown creator programs: which unblock coins, which are tail",
+    )
+    p.add_argument(
+        "programs",
+        help="file of `program_id[,coin_count]` lines, or '-' for stdin",
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_triage, needs_rpc=True)
+
+    p = sub.add_parser(
+        "find-curve", help="locate a mint's curve account without a pool row"
+    )
+    p.add_argument("program", help="the coin's creator_program")
+    p.add_argument("mint")
+    p.add_argument("--price", action="store_true", help="also decode what is found")
+    p.set_defaults(func=cmd_find_curve, needs_rpc=True)
 
     p = sub.add_parser("idl-status", help="which programs publish an IDL on chain")
     p.set_defaults(func=cmd_idl_status, needs_rpc=True)

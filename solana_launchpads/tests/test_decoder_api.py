@@ -161,6 +161,90 @@ def test_static_params_without_a_node_still_describes_the_launchpad():
     assert params["configs"] == {}
 
 
+def test_decoder_adopts_an_unregistered_program_that_publishes_an_idl():
+    """The registry is a head start, not a gate."""
+    import zlib
+
+    from launchpad_decoder.anchor_idl import account_discriminator
+    from launchpad_decoder.base58 import b58decode, b58encode
+    from launchpad_decoder.program_state import idl_address
+
+    program = b58encode(__import__("hashlib").sha256(b"brand-new-pad").digest())
+    idl = {
+        "address": program,
+        "metadata": {"name": "brand_new_pad", "version": "0.1.0"},
+        "accounts": [{"name": "Curve"}],
+        "types": [
+            {
+                "name": "Curve",
+                "type": {
+                    "kind": "struct",
+                    "fields": [
+                        {"name": "virtual_token_reserves", "type": "u64"},
+                        {"name": "virtual_sol_reserves", "type": "u64"},
+                        {"name": "token_total_supply", "type": "u64"},
+                        {"name": "base_mint", "type": "pubkey"},
+                    ],
+                },
+            }
+        ],
+    }
+    payload = zlib.compress(json.dumps(idl).encode())
+    source = StaticAccountSource(slot=1)
+    source.add_raw(
+        idl_address(program),
+        program,
+        account_discriminator("IdlAccount")
+        + b58decode("2P56vRWDrCBGkqYXxgSWAnuZQZrJPySRQGToTJThpmkN")
+        + len(payload).to_bytes(4, "little")
+        + payload,
+    )
+    schema = compile_idl(idl)
+    source.add_raw(
+        "So11111111111111111111111111111111111111112",
+        program,
+        encode_account(
+            idl,
+            schema,
+            "Curve",
+            {
+                "virtual_token_reserves": 1_073_000_000_000_000,
+                "virtual_sol_reserves": 30_000_000_000,
+                "token_total_supply": 1_000_000_000_000_000,
+                "base_mint": "MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG",
+            },
+        ),
+    )
+
+    decoder = LaunchpadDecoder(source, resolve_mints=False)
+    decoder._mint_decimals["MoonCVVNZFSYkqNXP6bxHLPL6QQJiMagDL3qcqUQTrG"] = 6
+    metrics = decoder.decode_address("So11111111111111111111111111111111111111112")
+
+    assert metrics is not None
+    assert metrics.launchpad == "learned:brand_new_pad"
+    assert program in decoder.learned_programs
+    assert metrics.current_price_quote.value == pytest.approx(2.7958993e-8, rel=1e-6)
+    assert metrics.total_supply.value == pytest.approx(1_000_000_000)
+
+
+def test_auto_learn_can_be_turned_off():
+    program = "GFMioXjhuDWMEBtuaoaDPJFPEnL2yDHCWKoVPhj1MeA7"  # registered
+    decoder = LaunchpadDecoder(StaticAccountSource(), auto_learn=False)
+    assert decoder._spec_for(program) is not None  # registry still works
+    unknown = "So11111111111111111111111111111111111111112"
+    assert decoder._spec_for(unknown) is None
+    assert decoder.learned_programs == {}
+
+
+def test_a_program_with_no_idl_is_recorded_as_unlearnable():
+    unknown = "So11111111111111111111111111111111111111112"
+    decoder = LaunchpadDecoder(StaticAccountSource())
+    assert decoder.learn_program(unknown) is None
+    assert "no IDL account" in decoder.unlearnable[unknown]
+    # and it is not retried on every subsequent account
+    assert decoder.learn_program(unknown) is None
+
+
 def test_snapshot_static_params_never_raises_on_one_bad_launchpad():
     snapshot = LaunchpadDecoder(None).snapshot_static_params()
     assert set(snapshot) == {spec.key for spec in LAUNCHPADS}
