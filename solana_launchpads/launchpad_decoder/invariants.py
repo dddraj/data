@@ -17,6 +17,13 @@ from different places and merged into one row. pump.fun makes this easy: its
 `virtual_quote_reserves` (index 30) as separate fields, the second appended
 later for non-SOL quote pairs. Read one from the account and the other from an
 event and the pair no longer multiplies to k.
+
+One limitation worth stating plainly: the opening k is read from the program's
+config *now*. If a launchpad ever changed its opening reserves, curves created
+before the change sit on a different k and will be flagged even though they are
+correct. The signature is distinctive -- a false positive of that kind is a
+*cluster* of old curves all off by the same ratio, whereas mixed fields scatter.
+Bucketing the observed k ratio tells the two apart immediately.
 """
 
 from __future__ import annotations
