@@ -26,7 +26,7 @@ from __future__ import annotations
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .adapters.heuristic import map_fields
 from .anchor_idl import ProgramSchema
@@ -353,6 +353,195 @@ def price_mint(decoder, program_id: str, mint: str):
         if metrics is not None:
             return metrics
     return None
+
+
+@dataclass
+class Check:
+    """One assertion about a launchpad, checked against a live node.
+
+    `severity` separates "decoding will be wrong" from "the snapshot has
+    drifted but still decodes". Only the former should fail a build; the
+    latter is a re-capture reminder, and failing CI over it trains people to
+    ignore the whole check.
+    """
+
+    launchpad: str
+    name: str
+    ok: bool
+    detail: str = ""
+    severity: str = "error"
+
+    @property
+    def blocking(self) -> bool:
+        return not self.ok and self.severity == "error"
+
+    def as_dict(self) -> Dict:
+        return {
+            "launchpad": self.launchpad,
+            "check": self.name,
+            "ok": self.ok,
+            "severity": self.severity,
+            "detail": self.detail,
+        }
+
+
+def _compare_schemas(
+    bundled: ProgramSchema, onchain: ProgramSchema, state_account: str
+) -> Tuple[List[str], List[str]]:
+    """Diff a bundled snapshot against the program's own IDL.
+
+    Returns ``(breaking, informational)``. The split matters: a program that
+    *appended* a field still decodes correctly from the bundled prefix, so
+    failing a build over it would be noise. A field that moved, or a
+    discriminator that changed, silently produces wrong numbers.
+    """
+    breaking: List[str] = []
+    info: List[str] = []
+
+    added = set(onchain.accounts) - set(bundled.accounts)
+    missing = set(bundled.accounts) - set(onchain.accounts)
+    if added:
+        info.append(f"program has account type(s) the snapshot lacks: {sorted(added)}")
+    if missing:
+        info.append(f"snapshot has account type(s) the program no longer lists: {sorted(missing)}")
+
+    for name in sorted(set(bundled.accounts) & set(onchain.accounts)):
+        if bundled.accounts[name].discriminator != onchain.accounts[name].discriminator:
+            breaking.append(f"{name}: discriminator changed -- accounts will not be recognised")
+
+    if state_account and state_account in bundled.accounts and state_account in onchain.accounts:
+        bundled_fields = [f for f, _ in bundled.accounts[state_account].layout.fields]
+        onchain_fields = [f for f, _ in onchain.accounts[state_account].layout.fields]
+        if bundled_fields != onchain_fields:
+            shared = min(len(bundled_fields), len(onchain_fields))
+            if bundled_fields[:shared] != onchain_fields[:shared]:
+                breaking.append(
+                    f"{state_account}: field order diverges -- the bundled layout "
+                    f"would mis-decode; re-capture the snapshot"
+                )
+            elif len(onchain_fields) > len(bundled_fields):
+                info.append(
+                    f"{state_account}: program appended "
+                    f"{onchain_fields[len(bundled_fields):]}; the prefix still decodes, "
+                    f"but re-capture to read the new fields"
+                )
+            else:
+                breaking.append(
+                    f"{state_account}: snapshot expects fields the program dropped: "
+                    f"{bundled_fields[len(onchain_fields):]}"
+                )
+    return breaking, info
+
+
+def verify_against_node(decoder, *, sample: bool = False) -> List[Check]:
+    """Check every registered launchpad against a live cluster.
+
+    Answers the question a bundled snapshot always raises: is this still what
+    the program looks like? Run it on first contact with a node, and again
+    after any upgrade the watcher reports.
+    """
+    if decoder.source is None:
+        raise RuntimeError("verify_against_node needs an AccountSource")
+
+    checks: List[Check] = []
+    for program_id, spec in list(decoder.specs.items()):
+
+        def add(
+            name: str, ok: bool, detail: str = "", severity: str = "error", _key=spec.key
+        ) -> None:
+            checks.append(Check(_key, name, ok, detail, severity))
+
+        account = decoder.source.get_account(program_id)
+        if account is None:
+            add("program exists", False, "not found on this cluster")
+            continue
+        add("program exists", True, f"owner {account.owner}")
+        if not account.executable:
+            add("program is executable", False, "account is not executable")
+            continue
+
+        try:
+            deployment = read_deployment(decoder.source, program_id)
+            add(
+                "deployment readable",
+                True,
+                f"slot {deployment.last_deploy_slot}, "
+                + ("immutable" if deployment.immutable else f"authority {deployment.upgrade_authority}"),
+            )
+        except ProgramStateError as exc:
+            add("deployment readable", False, str(exc))
+
+        bundled = decoder.bundled_schema(program_id)
+        try:
+            onchain = fetch_onchain_idl(decoder.source, program_id)
+        except Exception as exc:  # noqa: BLE001
+            onchain = None
+            add("on-chain IDL", False, f"present but unusable: {exc}")
+
+        if onchain is None:
+            add(
+                "on-chain IDL",
+                bundled is not None,
+                "absent -- the bundled snapshot is the only layout source"
+                if bundled is not None
+                else "absent, and no bundled snapshot either: this program "
+                "cannot be decoded until it publishes one",
+                severity="error" if bundled is None else "warning",
+            )
+        elif bundled is None:
+            add("on-chain IDL", True, f"{onchain.document.get('metadata', {})}")
+        else:
+            breaking, info = _compare_schemas(bundled, onchain.compile(), spec.state_account)
+            add(
+                "bundled layout still decodes this program",
+                not breaking,
+                "; ".join(breaking) if breaking else "no breaking drift",
+            )
+            if info:
+                add(
+                    "bundled snapshot is current",
+                    False,
+                    "; ".join(info),
+                    severity="warning",
+                )
+
+        schema = decoder.schema(program_id)
+        for config in spec.config_accounts:
+            if config.per_platform or not config.address:
+                continue
+            name, decoded, _slot = decoder.configs.fetch(program_id, config.address, schema)
+            add(
+                f"config {config.role} decodes",
+                decoded is not None,
+                f"{config.address} -> {name}" if decoded else f"{config.address} unreadable",
+            )
+
+        if sample and schema is not None and spec.state_account:
+            account_schema = schema.accounts.get(spec.state_account)
+            if account_schema is not None:
+                from .base58 import b58encode
+
+                try:
+                    rows = decoder.source.get_program_accounts(
+                        program_id,
+                        memcmp=[(0, b58encode(account_schema.discriminator))],
+                        limit=1,
+                    )
+                except Exception as exc:  # noqa: BLE001 - many nodes refuse gPA
+                    rows = []
+                    add("sample curve decodes", False, f"getProgramAccounts refused: {exc}")
+                else:
+                    if not rows:
+                        add("sample curve decodes", False, "no curve accounts returned")
+                    else:
+                        metrics = decoder.decode(rows[0])
+                        add(
+                            "sample curve decodes",
+                            metrics is not None,
+                            f"{rows[0].pubkey}: price="
+                            f"{metrics.current_price_quote.value if metrics else None}",
+                        )
+    return checks
 
 
 def classify_accounts(decoder, accounts: Iterable[AccountInfo]) -> Dict[str, int]:

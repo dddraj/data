@@ -122,6 +122,7 @@ export SOLANA_RPC=https://your-node:8899
 python scripts/launchpads.py params pumpfun        # live launch params + provenance
 python scripts/launchpads.py decode <address>      # one curve
 python scripts/launchpads.py platforms meteora_dbc # every DBC launchpad
+python scripts/launchpads.py selftest              # check bundled layouts vs the cluster
 python scripts/launchpads.py idl-status            # who publishes an IDL on chain
 python scripts/launchpads.py triage unpriced.csv   # classify unknown creator programs
 python scripts/launchpads.py find-curve <prog> <mint> --price
@@ -159,7 +160,7 @@ launchpad_decoder/
   rpc.py            AccountSource protocol + JSON-RPC and static implementations
   program_state.py  upgradeable-loader parsing, ProgramWatcher, on-chain IDL loader
   registry.py       launchpad registry + platform discovery metadata
-  discovery.py      triage unknown creator programs; mint -> curve with no index
+  discovery.py      triage unknown creator programs; mint -> curve; node selftest
   decoder.py        the façade
   adapters/         one per launchpad, plus the heuristic fallback
   idl/              bundled IDL snapshots
@@ -170,7 +171,7 @@ docs/
 scripts/
   launchpads.py             CLI
   live_node_example.py      live-feed wiring
-tests/                      109 tests, no network
+tests/                      139 tests, no network
 ```
 
 ## Tests
@@ -201,7 +202,10 @@ Ground truth is pinned wherever a published value exists:
 
 * Layout snapshots in `launchpad_decoder/idl/` were current when captured; the
   decoder prefers each program's on-chain IDL when one exists, and reports
-  which source it used in `metrics.schema_source`.
+  which source it used in `metrics.schema_source`. `selftest` checks the
+  snapshots against a live cluster and distinguishes harmless drift (an
+  appended field) from drift that would decode to wrong numbers (a reordered
+  field, a changed discriminator).
 * Moonit's curve reserve constants are compiled into its program binary, so
   they cannot be verified against a cluster. They are always tagged
   `bundled_snapshot`.

@@ -293,6 +293,49 @@ number rather than a hunch.
 
 ---
 
+## 6c. First contact with a real node
+
+A bundled IDL snapshot always raises the same question: is this still what the
+program looks like? `selftest` answers it against the live cluster.
+
+```bash
+python scripts/launchpads.py selftest            # add --sample to decode a real curve
+```
+
+```
+pumpfun
+  [ok  ] program exists                             owner BPFLoaderUpgradeab1e111…
+  [ok  ] deployment readable                        slot 351400000, authority 2P56vRW…
+  [ok  ] bundled layout still decodes this program  no breaking drift
+  [warn] bundled snapshot is current                BondingCurve: program appended
+                                                    ['is_boosted']; the prefix still
+                                                    decodes, but re-capture to read
+                                                    the new fields
+  [ok  ] config global decodes                      4wTV1Ymi… -> Global
+
+7/8 passed, 0 blocking, 1 warnings
+```
+
+The severity split is the point. Two kinds of drift, with very different costs:
+
+| | Effect | Severity |
+|---|---|---|
+| a field **appended** | the bundled prefix still decodes correctly | warning |
+| an account type added or removed | informational | warning |
+| a field **reordered** | silently decodes to *wrong numbers* | blocking |
+| a discriminator changed | accounts stop being recognised | blocking |
+| a field dropped | snapshot reads past the end | blocking |
+| no on-chain IDL **and** no snapshot | nothing can decode it | blocking |
+
+Only blocking checks exit non-zero. Failing a build over a harmless appended
+field trains people to ignore the check, which costs more than the drift does.
+
+Run it on first contact, and again after any upgrade `refresh()` reports — the
+two together are the whole staleness story: the watcher says *something moved*,
+the selftest says *whether it matters*.
+
+---
+
 ## 7. Transport independence
 
 Everything goes through the `AccountSource` protocol:

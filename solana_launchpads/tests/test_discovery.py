@@ -123,7 +123,7 @@ def deploy(source: StaticAccountSource, program_id: str, slot: int = 100) -> Non
     source.add_raw(
         program_id,
         BPF_LOADER_UPGRADEABLE,
-        (2).to_bytes(4, "little") + b58decode(program_id),
+        (2).to_bytes(4, "little") + b58decode(programdata_address(program_id)),
         executable=True,
     )
     header = (3).to_bytes(4, "little") + slot.to_bytes(8, "little") + b"\x01" + b58decode(AUTHORITY)

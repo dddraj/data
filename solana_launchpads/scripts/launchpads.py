@@ -296,6 +296,39 @@ def cmd_find_curve(args) -> None:
         )
 
 
+def cmd_selftest(args) -> None:
+    """Validate the bundled snapshots against a live cluster."""
+    from launchpad_decoder.discovery import verify_against_node
+
+    decoder = make_decoder(args)
+    checks = verify_against_node(decoder, sample=args.sample)
+    if args.json:
+        print(json.dumps([c.as_dict() for c in checks], indent=2, default=str))
+        return
+
+    current = None
+    for check in checks:
+        if check.launchpad != current:
+            current = check.launchpad
+            print(f"\n{current}")
+        mark = "ok  " if check.ok else ("FAIL" if check.severity == "error" else "warn")
+        print(f"  [{mark}] {check.name:42} {check.detail}")
+
+    blocking = [c for c in checks if c.blocking]
+    warnings = [c for c in checks if not c.ok and not c.blocking]
+    print(
+        f"\n{sum(1 for c in checks if c.ok)}/{len(checks)} checks passed, "
+        f"{len(blocking)} blocking, {len(warnings)} warnings"
+    )
+    for check in blocking:
+        print(f"  BLOCKING  {check.launchpad}: {check.name} -- {check.detail}")
+    for check in warnings:
+        print(f"  warning   {check.launchpad}: {check.name} -- {check.detail}")
+    # Only a layout that would decode *wrongly* fails the run; a snapshot that
+    # has merely drifted is a re-capture reminder, not a broken build.
+    raise SystemExit(1 if blocking else 0)
+
+
 def cmd_idl_status(args) -> None:
     decoder = make_decoder(args)
     for key, status in sorted(decoder.onchain_idl_status().items()):
@@ -382,6 +415,17 @@ def main() -> None:
     p.add_argument("mint")
     p.add_argument("--price", action="store_true", help="also decode what is found")
     p.set_defaults(func=cmd_find_curve, needs_rpc=True)
+
+    p = sub.add_parser(
+        "selftest", help="check the bundled layouts against a live cluster"
+    )
+    p.add_argument(
+        "--sample",
+        action="store_true",
+        help="also decode one real curve per launchpad (needs getProgramAccounts)",
+    )
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_selftest, needs_rpc=True)
 
     p = sub.add_parser("idl-status", help="which programs publish an IDL on chain")
     p.set_defaults(func=cmd_idl_status, needs_rpc=True)

@@ -81,11 +81,23 @@ class JsonRpcAccountSource:
         self._ids = itertools.count(1)
 
     # -- transport ------------------------------------------------------
+    @staticmethod
+    def _retryable(exc: Exception) -> bool:
+        """Only back off on things a retry could plausibly fix.
+
+        A 400 from a malformed request will fail identically every time, so
+        retrying it just burns 14 seconds of backoff before surfacing the same
+        error. Rate limits and server errors are worth another go.
+        """
+        if isinstance(exc, urllib.error.HTTPError):
+            return exc.code == 429 or exc.code >= 500
+        return isinstance(exc, (urllib.error.URLError, TimeoutError, json.JSONDecodeError))
+
     def _call(self, method: str, params: list):
         payload = json.dumps(
             {"jsonrpc": "2.0", "id": next(self._ids), "method": method, "params": params}
         ).encode()
-        last_exc: Optional[Exception] = None
+        body = None
         for attempt in range(self.max_retries):
             request = urllib.request.Request(self.endpoint, data=payload, headers=self.headers)
             try:
@@ -93,15 +105,17 @@ class JsonRpcAccountSource:
                     body = json.loads(response.read().decode())
                 break
             except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
-                last_exc = exc
-                if attempt == self.max_retries - 1:
-                    raise RpcError(f"{method} failed after {self.max_retries} tries: {exc}") from exc
+                last = attempt == self.max_retries - 1
+                if last or not self._retryable(exc):
+                    raise RpcError(f"{method} failed: {exc}") from exc
                 time.sleep(2**attempt)
-        else:  # pragma: no cover - loop always breaks or raises
-            raise RpcError(str(last_exc))
 
+        if not isinstance(body, dict):
+            raise RpcError(f"{method}: malformed response {body!r}")
         if "error" in body:
             raise RpcError(f"{method}: {body['error']}")
+        if "result" not in body:
+            raise RpcError(f"{method}: response carried no result")
         return body["result"]
 
     # -- helpers --------------------------------------------------------
@@ -154,11 +168,22 @@ class JsonRpcAccountSource:
         memcmp: Optional[Sequence[tuple]] = None,
         limit: Optional[int] = None,
     ) -> List[AccountInfo]:
+        """Filtered program accounts.
+
+        Note that `limit` is applied *after* the node has responded -- Solana's
+        `getProgramAccounts` has no server-side limit. On a program the size of
+        pump.fun, filter hard (a discriminator memcmp at minimum) or the node
+        will refuse the call; most public endpoints disable it entirely.
+        """
         filters: List[dict] = []
         if data_size is not None:
             filters.append({"dataSize": data_size})
         for offset, blob in memcmp or ():
-            filters.append({"memcmp": {"offset": offset, "bytes": blob}})
+            # Spell the encoding out: some nodes now require it rather than
+            # defaulting to base58.
+            filters.append(
+                {"memcmp": {"offset": offset, "bytes": blob, "encoding": "base58"}}
+            )
         config = {"encoding": "base64", "commitment": self.commitment, "withContext": True}
         if filters:
             config["filters"] = filters
