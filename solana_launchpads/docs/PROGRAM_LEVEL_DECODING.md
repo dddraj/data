@@ -174,6 +174,78 @@ from 85.005 SOL to 170.011 SOL with no code change and no restart.
   renames (`virtual_sol_reserves` → `virtual_quote_reserves`) and anything else
   surfaces as a missing value rather than a wrong one.
 
+### 5b. Hot reload is two halves, and the second one is easy to miss
+
+Swapping a layout at runtime does nothing on its own if the stream is still
+serving the old subscription. Most feeds compose their filter set **once, at
+connect time** — a Geyser `SubscribeRequest`, a websocket `accountSubscribe` —
+so an account whose owner is not already in that request never arrives, however
+current the decoder's layouts are. The decode side hot-swaps and the data side
+goes quiet, with no error anywhere.
+
+Two things move the filter set:
+
+* **A newly learned program.** Its accounts reached you only because one
+  happened to be in the stream already; the rest need the owner subscribed.
+* **A redeploy that renames an account struct.** The discriminator is
+  `sha256("account:<Name>")[:8]`, so a rename moves it and the old memcmp
+  matches nothing.
+
+The second is nastier than it looks. A registry entry pins `state_account` by
+name, and after a rename that name resolves to nothing — so the naive filter
+builder emits *no filter at all* for that program rather than a stale one.
+`curve_account_filters()` therefore falls back to whatever accounts the schema
+now declares when the pinned name has gone.
+
+`LiveDecoder` owns its filter set for this reason and reports a
+`SubscriptionChange` whenever it moves:
+
+```python
+live = LiveDecoder(decoder)
+node.subscribe(live.filters())
+
+# ... later, driven by a ProgramData update or a learned program
+if live.pending_resubscribe:
+    print(live.pending_resubscribe.describe())   # "+newpad/Curve, -newpad/BondingCurve"
+    node.subscribe(live.filters())
+    live.pending_resubscribe = None
+```
+
+`tests/test_live_wiring.py` pins both cases, and that a redeploy which does
+*not* touch the layout raises no resubscribe — churning the subscription on
+every upgrade is its own outage.
+
+### 5c. What a program with no published IDL falls back to
+
+`SchemaCache.get()` tries the on-chain IDL first and never raises on failure:
+
+1. `fetch_onchain_idl()` — the program's own IDL account. Preferred, because it
+   is the program's current truth.
+2. the **bundled IDL snapshot** in `launchpad_decoder/idl/`, when the on-chain
+   read returns nothing or does not compile. The reason is recorded in
+   `SchemaCache.errors` rather than thrown, so one program with a broken IDL
+   cannot stop the other seven decoding.
+3. nothing. A program with neither is left undecodable and `learn_program()`
+   records why in `decoder.unlearnable`. That is a NULL, not a guess.
+
+The cache is keyed on `deployment.revision()` — `(last_deploy_slot,
+executable_len, …)` — so the swap is automatic: a redeploy changes the
+revision, the next `get()` misses, and the layout is re-fetched. That is the
+whole hot-reload mechanism, and it is the same one that makes "constants are
+program state" work.
+
+**Cost of the ProgramData re-read.** `watcher.poll()` is one `getAccountInfo`
+per tracked program — eight for the whole registry — and with
+`hash_executable=False` (the default) only the 45-byte
+`ProgramData` header is needed, so a `dataSlice` keeps each one tiny. A timer
+is entirely affordable at any interval you like.
+
+A subscription is still better, and the address list is already there:
+`watcher.programdata_addresses()` returns exactly the accounts to subscribe to,
+which is what `programdata_filters()` in the example does. Then a redeploy
+pushes to you and there is no polling interval to tune. Poll only as a
+backstop, if at all.
+
 ---
 
 ## 6. Handle launchpads that do not exist yet

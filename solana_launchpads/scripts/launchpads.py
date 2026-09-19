@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -109,6 +110,161 @@ def cmd_math(args) -> None:
     print(f"    raise target        : {ui_amount(target, 9):,.6f} SOL")
     print(f"    graduation price    : {final:.10e} SOL")
     print(f"    graduation mkt cap  : {final * supply:,.2f} SOL")
+
+
+def econ_rows(args) -> list:
+    """One row per launchpad describing how to compute curve progress.
+
+    Values, where a launchpad has any at program scope, are filled from the
+    chain when a node is available and from the bundled snapshot otherwise --
+    tagged either way, so a consumer can tell which it got.
+    """
+    from launchpad_decoder import curves, econ
+    from launchpad_decoder.types import ui_amount
+
+    live = {}
+    if getattr(args, "rpc", None):
+        decoder = make_decoder(args)
+        try:
+            live = decoder.snapshot_static_params(["pumpfun"]) or {}
+        except Exception as exc:  # noqa: BLE001 - offline is a supported mode
+            print(f"# could not read live parameters ({exc}); using the snapshot",
+                  file=sys.stderr)
+
+    rows = []
+    for row in econ.ECON:
+        spec = get_spec(row.launchpad)
+        base = {
+            "launchpad": row.launchpad,
+            "program_id": row.program_id,
+            "scope": row.scope,
+            "needs_a_table": row.needs_a_table,
+            "source_account": row.source_account,
+            "state_account": spec.state_account or None,
+            "curve_family": spec.curve_family.value,
+            "progress_numerator": row.raised_field,
+            "progress_denominator": row.target_field,
+            "tokens_for_sale_field": row.tokens_for_sale_field,
+            "initial_quote_field": row.initial_quote_field,
+            "initial_base_field": row.initial_base_field,
+            "target_is_derived": row.target_is_derived,
+            "initial_quote": None,
+            "initial_base": None,
+            "tokens_for_sale": None,
+            "raise_target_quote": None,
+            "quote_mint": None,
+            "values_source": None,
+            "note": row.note,
+        }
+        if row.scope != "program":
+            rows.append(base)
+            continue
+
+        # pump.fun, and only pump.fun: values are fixed per program, and it
+        # seeds two variants, so emit one row each.
+        cfg = dict(GLOBAL_SNAPSHOT)
+        values_source = "bundled_snapshot"
+        snapshot = (live.get("pumpfun") or {}).get("parameters") if live else None
+        if isinstance(snapshot, dict):
+            for key in list(cfg) + ["initial_virtual_quote_reserves"]:
+                value = snapshot.get(key)
+                if isinstance(value, dict):
+                    value = value.get("value")
+                if isinstance(value, int):
+                    cfg[key] = value
+            values_source = "onchain_config"
+
+        ivt = cfg["initial_virtual_token_reserves"]
+        irt = cfg["initial_real_token_reserves"]
+        # Both variants always get a row: the non-SOL opening is a real field
+        # on Global and a warehouse needs somewhere to put it. Its value is
+        # only filled from a live read -- this build carries no verified
+        # snapshot of it, and inventing one is how a wrong constant ships.
+        variants = [
+            ("sol", cfg.get("initial_virtual_sol_reserves"), spec.default_quote_mint, 9),
+            ("quote", cfg.get("initial_virtual_quote_reserves"), None, 6),
+        ]
+
+        for variant, ivq, quote_mint, quote_decimals in variants:
+            if not ivq:
+                rows.append({
+                    **base,
+                    "variant": variant,
+                    "quote_decimals": quote_decimals,
+                    "values_source": "unavailable",
+                    "note": (
+                        "Global.initial_virtual_quote_reserves is the opening for "
+                        "non-SOL-quoted coins and this build has no verified "
+                        "snapshot of it -- run `econ --rpc` to read it. Mind the "
+                        "decimals when you do: the same reserve reads as 4.292 at "
+                        "9 decimals and 4292 at the 6 a USDC-quoted coin uses, so "
+                        "store the RAW integer and the quote mint, never a scaled "
+                        "number on its own. " + base["note"]
+                    ),
+                })
+                continue
+            target = curves.cp_raise_for_supply(ivq, ivt, irt)
+            rows.append({
+                **base,
+                "variant": variant,
+                # Raw integers are the primary values. A UI number without its
+                # decimals is a 1000x waiting to happen: the SOL-quoted opening
+                # scales by 1e9 and the non-SOL one by the quote mint's own
+                # decimals, so "4.292" and "4292" are the same reserve read two
+                # ways. Every consumer should key off *_raw.
+                "initial_quote_raw": ivq,
+                "initial_base_raw": ivt,
+                "tokens_for_sale_raw": irt,
+                "raise_target_quote_raw": target,
+                "quote_decimals": quote_decimals,
+                "base_decimals": 6,
+                "initial_quote": ui_amount(ivq, quote_decimals),
+                "initial_base": ui_amount(ivt, 6),
+                "tokens_for_sale": ui_amount(irt, 6),
+                "raise_target_quote": ui_amount(target, quote_decimals),
+                "quote_mint": quote_mint,
+                "values_source": values_source,
+            })
+    return rows
+
+
+def cmd_econ(args) -> None:
+    rows = econ_rows(args)
+    if args.json:
+        print(json.dumps(rows, indent=2, default=str))
+        return
+    if args.csv:
+        columns = sorted({key for row in rows for key in row})
+        writer = csv.DictWriter(sys.stdout, fieldnames=columns)
+        writer.writeheader()
+        writer.writerows(rows)
+        return
+
+    print("Curve economics, by the scope at which each launchpad fixes them.\n")
+    print("A per-program table is correct for pump.fun and for nothing else: see")
+    print("the scope column before keying anything on program_id.\n")
+    for row in rows:
+        variant = f" [{row['variant']}]" if row.get("variant") else ""
+        print(f"{row['launchpad']}{variant}  scope={row['scope']}  [{row['program_id']}]")
+        if row["progress_numerator"] and row["progress_denominator"]:
+            print(f"    progress = {row['progress_numerator']} / "
+                  f"{row['progress_denominator']}   (on {row['source_account']})")
+        elif row["scope"] == "none":
+            print("    progress = null -- this program has no graduation")
+        else:
+            print("    progress = not a stored division; take raised_quote / "
+                  "raise_target_quote off the decoder")
+        if row.get("raise_target_quote_raw") is not None:
+            print(f"    raw : initial_quote {row['initial_quote_raw']:,}   "
+                  f"initial_base {row['initial_base_raw']:,}   "
+                  f"tokens_for_sale {row['tokens_for_sale_raw']:,}")
+            print(f"          raise_target_quote {row['raise_target_quote_raw']:,}"
+                  f"   ({row['values_source']})")
+            print(f"    ui  : at {row['quote_decimals']} quote / "
+                  f"{row['base_decimals']} base decimals -> "
+                  f"initial_quote {row['initial_quote']:,.6f}, "
+                  f"raise_target {row['raise_target_quote']:,.9f}")
+        print(f"    {row['note']}\n")
 
 
 def cmd_params(args) -> None:
@@ -426,6 +582,14 @@ def main() -> None:
     )
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_selftest, needs_rpc=True)
+
+    p = sub.add_parser(
+        "econ",
+        help="per-launchpad curve economics and how to compute progress",
+    )
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--csv", action="store_true")
+    p.set_defaults(func=cmd_econ, needs_rpc=False)
 
     p = sub.add_parser("idl-status", help="which programs publish an IDL on chain")
     p.set_defaults(func=cmd_idl_status, needs_rpc=True)

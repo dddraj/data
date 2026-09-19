@@ -19,6 +19,17 @@ Three things have to be wired up:
    and config accounts are dropped and the parameter diff is returned so you
    can log exactly which launch constant moved.
 
+**And the part that is easy to miss.**  Hot-swapping a layout is only half of
+a hot reload.  Most streams compose their subscription once, at connect time
+-- a Geyser `SubscribeRequest`, a websocket `accountSubscribe` -- so an account
+whose owner is not already in that request never arrives, however good the
+decoder is.  Two things change the filter set under you: a program upgrade that
+renames an account struct (its 8-byte discriminator moves, so the old memcmp
+matches nothing), and a newly learned program (its owner was never subscribed
+at all).  `LiveDecoder` therefore owns its filter set and reports a
+`SubscriptionChange` whenever it moves; act on that by re-issuing the
+subscription, or the swapped layout decodes a stream that has gone quiet.
+
 Run this file directly for a simulated feed that needs no node:
 
     python scripts/live_node_example.py
@@ -28,6 +39,7 @@ from __future__ import annotations
 
 import json
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -53,7 +65,16 @@ def curve_account_filters(decoder: LaunchpadDecoder) -> List[Dict[str, object]]:
         if schema is None:
             filters.append({"launchpad": spec.key, "owner": program_id, "memcmp_base58": None})
             continue
-        names = [spec.state_account] if spec.state_account else list(schema.accounts)
+        # Prefer the registered state account, but only while the schema still
+        # has it. A redeploy that RENAMES the struct would otherwise leave this
+        # program with no filter at all: the old name resolves to nothing and
+        # the new one is never reached, so the stream goes quiet with no error
+        # anywhere. Falling back to whatever the schema now declares keeps the
+        # subscription alive across the rename.
+        if spec.state_account and spec.state_account in schema.accounts:
+            names = [spec.state_account]
+        else:
+            names = list(schema.accounts)
         for name in names:
             account = schema.accounts.get(name)
             if account is None:
@@ -78,6 +99,35 @@ def programdata_filters(decoder: LaunchpadDecoder) -> Dict[str, str]:
     return decoder.watcher.programdata_addresses()
 
 
+def filter_key(entry: Dict[str, object]) -> Tuple:
+    """Identity of one filter, for diffing two subscription sets."""
+    return (entry.get("owner"), entry.get("account_type"), entry.get("memcmp_base58"))
+
+
+@dataclass
+class SubscriptionChange:
+    """The filter set moved -- re-issue the subscription.
+
+    A decoder that hot-swaps its layouts while the stream keeps delivering the
+    old filter set has fixed nothing: accounts it can now decode never arrive.
+    """
+
+    reason: str
+    added: List[Dict[str, object]] = field(default_factory=list)
+    removed: List[Dict[str, object]] = field(default_factory=list)
+
+    def __bool__(self) -> bool:
+        return bool(self.added or self.removed)
+
+    def describe(self) -> str:
+        parts = []
+        for entry in self.added:
+            parts.append(f"+{entry.get('launchpad')}/{entry.get('account_type') or '*'}")
+        for entry in self.removed:
+            parts.append(f"-{entry.get('launchpad')}/{entry.get('account_type') or '*'}")
+        return f"{self.reason}: " + ", ".join(parts)
+
+
 class LiveDecoder:
     """A thin event loop you can drop your stream into."""
 
@@ -89,6 +139,29 @@ class LiveDecoder:
         }
         if decoder.source is not None:
             decoder.snapshot_static_params()
+        self._filters: List[Dict[str, object]] = curve_account_filters(decoder)
+        #: set when the filter set moves; clear it once you have resubscribed
+        self.pending_resubscribe: Optional[SubscriptionChange] = None
+
+    def filters(self) -> List[Dict[str, object]]:
+        """The subscription the node should currently be serving."""
+        return list(self._filters)
+
+    def _sync_filters(self, reason: str) -> Optional[SubscriptionChange]:
+        """Recompute the filter set and report any movement."""
+        current = curve_account_filters(self.decoder)
+        before = {filter_key(entry): entry for entry in self._filters}
+        after = {filter_key(entry): entry for entry in current}
+        change = SubscriptionChange(
+            reason=reason,
+            added=[entry for key, entry in after.items() if key not in before],
+            removed=[entry for key, entry in before.items() if key not in after],
+        )
+        self._filters = current
+        if not change:
+            return None
+        self.pending_resubscribe = change
+        return change
 
     def on_account_update(
         self, owner: str, address: str, data: bytes, slot: int
@@ -97,7 +170,16 @@ class LiveDecoder:
         if address in self.programdata:
             self.on_program_upgrade(self.programdata[address])
             return None
-        return self.decoder.decode_account_data(owner, data, address, slot)
+        known = owner in self.decoder.specs
+        metrics = self.decoder.decode_account_data(owner, data, address, slot)
+        if not known and owner in self.decoder.specs:
+            # decode_account_data adopted a program nobody had catalogued. Its
+            # accounts are reaching us only because this one happened to be in
+            # the stream already; the rest need a subscription.
+            change = self._sync_filters(f"learned program {owner}")
+            if change:
+                print(f"[subscribe] {change.describe()}")
+        return metrics
 
     def on_program_upgrade(self, program_id: str) -> None:
         report = self.decoder.refresh()
@@ -107,6 +189,12 @@ class LiveDecoder:
             print(f"[upgrade] {upgrade.describe()}")
         for change in report.changes:
             print(f"[param]   {change.describe()}")
+        # A redeploy can rename an account struct, which moves its
+        # discriminator. The old memcmp then matches nothing and the stream
+        # goes quiet -- silently, which is the worst way for it to fail.
+        moved = self._sync_filters(f"upgrade of {program_id}")
+        if moved:
+            print(f"[subscribe] {moved.describe()}")
 
 
 # --------------------------------------------------------------------------

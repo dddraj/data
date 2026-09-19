@@ -169,9 +169,9 @@ docs/
   CURVE_MATH.md             every formula, derived
   PROGRAM_LEVEL_DECODING.md the architecture and the upgrade story
 scripts/
-  launchpads.py             CLI
-  live_node_example.py      live-feed wiring
-tests/                      170 tests, no network
+  launchpads.py             CLI (`econ` prints the curve-economics map)
+  live_node_example.py      live-feed wiring, incl. subscription refresh
+tests/                      183 tests, no network
 ```
 
 ## Go
@@ -193,7 +193,7 @@ here and runs out of band.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q     # 170, offline
+python -m pytest tests/ -q     # 183, offline
 (cd go && go test ./...)       # 56, offline
 ```
 
