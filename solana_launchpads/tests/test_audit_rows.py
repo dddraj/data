@@ -69,6 +69,9 @@ def build(curves):
     )
     for mint, virtual_quote, real_quote in curves:
         v_base = (IVT * IVS) // virtual_quote
+        # The real base has to come down with the virtual one, or the curve
+        # holds more tokens than it has -- which the opening check now rejects.
+        real_base = IRT - (IVT - v_base)
         source.add_raw(
             pdas.pumpfun_bonding_curve(mint),
             PUMP.program_id,
@@ -79,7 +82,7 @@ def build(curves):
                 {
                     "virtual_token_reserves": v_base,
                     "virtual_quote_reserves": virtual_quote,
-                    "real_token_reserves": IRT,
+                    "real_token_reserves": real_base,
                     "real_quote_reserves": real_quote,
                     "token_total_supply": 1_000_000_000_000_000,
                 },
@@ -167,8 +170,17 @@ def test_csv_values_are_parsed_leniently():
     assert audit_rows.as_int(None) is None
 
 
-def test_on_chain_invariant_failures_are_counted_separately():
-    """If the chain itself is inconsistent, that is a different finding."""
+def test_a_nonstandard_opening_is_not_reported_as_a_broken_row():
+    """The distinction that matters, and the one this tool originally got wrong.
+
+    A curve whose opening matches no constant in today's Global is not thereby
+    broken. Measured against a real node, every stored column held exactly the
+    on-chain field its name claimed and the curve still failed the old check --
+    which was the check over-reaching, on roughly 9% of pump.fun curves.
+
+    So an unfamiliar opening is reported, loudly, as its own category; only a
+    structurally impossible one counts as a failure.
+    """
     idl = json.loads((IDL_DIR / "pump.json").read_text())
     schema = compile_idl(idl)
     source = build([])
@@ -184,6 +196,36 @@ def test_on_chain_invariant_failures_are_counted_separately():
                 "virtual_token_reserves": 1_077_887_039_606_396,
                 "virtual_quote_reserves": 18_204_928_211,
                 "real_token_reserves": IRT,
+                "token_total_supply": 1_000_000_000_000_000,
+            },
+        ),
+    )
+    decoder = LaunchpadDecoder(source, resolve_mints=False)
+    report = audit_rows.audit(decoder, [{"mint": mint}], PUMP.program_id)
+    assert report["rows_failing_curve_invariant_on_chain"] == 0
+    assert report["rows_with_a_nonstandard_opening"] == 1
+    # And the bucket an operator needs: the opening this curve actually claims.
+    assert report["opening_buckets"] == {18_204_928_211: 1}
+
+
+def test_structurally_impossible_state_is_still_a_failure():
+    """A virtual reserve below its real counterpart is impossible on any curve."""
+    idl = json.loads((IDL_DIR / "pump.json").read_text())
+    schema = compile_idl(idl)
+    source = build([])
+    mint = mint_for("impossible-chain")
+    source.add_raw(
+        pdas.pumpfun_bonding_curve(mint),
+        PUMP.program_id,
+        encode_account(
+            idl,
+            schema,
+            "BondingCurve",
+            {
+                "virtual_token_reserves": IVT,
+                "virtual_quote_reserves": 670_000_000,
+                "real_token_reserves": IRT,
+                "real_quote_reserves": 670_000_000,
                 "token_total_supply": 1_000_000_000_000_000,
             },
         ),

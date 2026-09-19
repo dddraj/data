@@ -360,12 +360,42 @@ def test_an_upgrade_changes_the_prices_the_decoder_reports():
     source.add_raw(pdas.pumpfun_global(), PUMP, pump_global_blob(60_000_000_000))
 
     assert decoder.refresh()
-    second = decoder.decode_address(address)
+
+    # A curve created AFTER the upgrade is seeded with the new reserve, and
+    # that is the one whose numbers double.
+    fresh_address = "So11111111111111111111111111111111111111113"
+    source.add_raw(
+        fresh_address,
+        PUMP,
+        encode_account(
+            idl,
+            schema,
+            "BondingCurve",
+            {
+                "virtual_token_reserves": 1_073_000_000_000_000,
+                "virtual_quote_reserves": 60_000_000_000,
+                "real_token_reserves": 793_100_000_000_000,
+                "token_total_supply": 1_000_000_000_000_000,
+            },
+        ),
+    )
+    second = decoder.decode_address(fresh_address)
     assert second.raise_target_quote.value == pytest.approx(170.010718, rel=1e-6)
     assert second.launch_price_quote.value == pytest.approx(
         2 * first.launch_price_quote.value, rel=1e-9
     )
     assert second.launch_price_quote.source is ValueSource.ONCHAIN_CONFIG
+
+    # But the curve that already existed keeps the opening it was seeded with.
+    # A curve's opening is baked in at creation, so repricing it against the
+    # program's new default would be wrong -- and reporting it as broken for
+    # not matching would be worse.
+    unchanged = decoder.decode_address(address)
+    assert unchanged.raise_target_quote.value == pytest.approx(85.005359, rel=1e-6)
+    assert unchanged.launch_price_quote.value == pytest.approx(
+        first.launch_price_quote.value, rel=1e-9
+    )
+    assert not [w for w in unchanged.warnings if "k_violation" in w]
 
 
 def test_config_cache_is_not_dropped_without_an_upgrade():

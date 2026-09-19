@@ -80,42 +80,88 @@ graduate, ~411 SOL at migration. `tests/test_curves.py` pins all of them.
 Note `raiseTarget` is **pre-fee**. pump.fun charges `fee_basis_points` on top,
 so a buyer pays ≈ 85.005 × 1.01 SOL to fill the curve.
 
-### The reserve offset, and why it beats matching k
+### A curve states its own opening
 
-pump.fun's buy and sell add the post-fee amount to the virtual **and** the real
-quote reserve together. So their difference never moves:
+pump.fun moves each virtual reserve in lockstep with its real counterpart: a
+buy subtracts the same token amount from `virtual_token_reserves` and
+`real_token_reserves`, and adds the same quote amount to
+`virtual_quote_reserves` and `real_quote_reserves`. So two differences never
+move for the whole life of a curve, and both of them are opening parameters:
 
 ```
-virtual_quote - real_quote == initial_virtual_quote_reserves
+quote_seed = virtual_quote - real_quote == initial_virtual_quote_reserves
+base_floor = virtual_base  - real_base  == initial_virtual_token_reserves
+                                           - initial_real_token_reserves
 ```
 
-for the whole life of the curve, through any number of buys and sells.
+`base_floor` is also the virtual base the curve ends on, which is why the
+graduation price is `(quote_seed + raise) / base_floor`.
 
-That is more useful than it looks, because pump.fun seeds **two** kinds of curve
-with different openings — 30 SOL for SOL-quoted coins, and
+Since k is conserved, the rest of the opening inverts out of those two:
+
+```
+initial_real_base = virtual_base × virtual_quote / quote_seed − base_floor
+```
+
+So the four reserve fields state the curve's entire opening, with no Global
+account needed. That is useful for classification, because pump.fun seeds
+**more than one** kind of curve — 30 SOL for SOL-quoted coins,
 `initial_virtual_quote_reserves` (4.292 at the time of writing) for non-SOL ones
-— and the curve account does not record which it is. The offset does, exactly:
+— and the curve account does not record which it is. The offset does, exactly,
+with integer equality and no tolerance, and it keeps working after the curve has
+traded away from its opening.
 
-| `virtual_quote - real_quote` | variant |
+| `virtual_quote − real_quote` | variant |
 |---|---|
 | `initial_virtual_sol_reserves` | SOL-quoted |
 | `initial_virtual_quote_reserves` | non-SOL-quoted |
-| anything else | the pair did not come from one read |
+| anything else positive | an opening this build does not use — see below |
+| zero or negative | impossible; the virtual column is carrying the real one |
 
-This beats classifying by matching k against each candidate, for two reasons.
-It needs no tolerance — it is integer equality. And it keeps working after the
-curve has traded away from its opening, whereas counting curves that still sit
-in a narrow band *around* an opening value finds almost none of them, because
-curves that trade leave the band immediately.
+### What this does *not* let you do
 
-An offset near zero is its own diagnosis: that is what a virtual column
-carrying the **real** reserve looks like, since the two are then the same
-number or the real one was defaulted away.
+It is tempting to go one step further and treat "matches no known constant" as
+proof that a row is corrupt. That inference is wrong, and it is wrong at scale.
 
-Both opening constants give the same launch market cap in fiat terms, which is
-a useful sanity check on the reading: 30 SOL over 1.073e9 tokens is ~28 SOL,
-and 4.292 over the same supply is 4,000 in a 6-decimal quote — both about
-$4,000 at the SOL price the constants were chosen at.
+Measured against a real node on 60 sampled pump.fun curves, every stored column
+held exactly the on-chain field its name claimed — and 59 of the 60 still failed
+a k check against today's `Global`. The chain was right and the check was
+over-reaching, on roughly 9% of pump.fun curves. A program that has changed its
+seed, or that seeds one per quote mint, leaves a large population of curves
+whose opening is real and simply not in the candidate list.
+
+Worse, the self-consistency test that replaces it is **circular**. Because the
+four reserves determine the curve's own opening exactly, k against that opening
+holds by construction — there is nothing for it to catch. Concretely:
+
+```
+implied_real_base − real_base = virtual_base × real_quote / quote_seed
+```
+
+which is positive whenever `real_quote` is, for any values at all.
+
+So: **a single row cannot prove itself wrong once you stop trusting the
+program's constants.** All that survives is positivity — no curve opens at zero
+or holds more tokens than the mint has. Everything beyond that needs evidence
+from outside the row, and there are three places it can come from:
+
+* **the population** — bucket `virtual_quote − real_quote` across every curve.
+  A real opening is shared by thousands of rows; a corrupted value is unique to
+  its own row. `scripts/audit_rows.py` prints this histogram.
+* **the curve's history** — k is conserved, so k must not *move* for a given
+  curve between slots, whatever its value. This needs no constants at all and is
+  the strongest test available to anyone storing per-slot state.
+* **the known constants** — exact, but only for the openings the program uses
+  today, which is where this started.
+
+The decoder therefore prices a curve against the opening the curve itself
+states, reports an unfamiliar opening as a **warning** rather than an error, and
+leaves the verdict to whoever can see the population.
+
+Both known opening constants give the same launch market cap in fiat terms,
+which is a useful sanity check on the reading: 30 SOL over 1.073e9 tokens is
+~28 SOL, and 4.292 over the same supply is 4,000 in a 6-decimal quote — both
+about $4,000 at the SOL price the constants were chosen at.
 
 ---
 

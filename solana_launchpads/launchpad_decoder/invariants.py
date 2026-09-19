@@ -18,12 +18,39 @@ from different places and merged into one row. pump.fun makes this easy: its
 later for non-SOL quote pairs. Read one from the account and the other from an
 event and the pair no longer multiplies to k.
 
-One limitation worth stating plainly: the opening k is read from the program's
-config *now*. If a launchpad ever changed its opening reserves, curves created
-before the change sit on a different k and will be flagged even though they are
-correct. The signature is distinctive -- a false positive of that kind is a
-*cluster* of old curves all off by the same ratio, whereas mixed fields scatter.
-Bucketing the observed k ratio tells the two apart immediately.
+The limit of this, stated plainly, because it was measured rather than guessed
+and it is easy to overstate what a curve can tell you about itself.
+
+The opening k is read from the program's config *now*. If a launchpad ever
+changed its opening reserves, or seeds a different opening per quote mint,
+curves created under another constant sit on a different k. Judged against
+today's Global they are flagged, and they are not wrong -- the check is.
+Measured against a real node on 60 sampled curves, every stored column held
+exactly the on-chain field its name claimed and 59 of 60 still failed this
+check. That is the check over-reaching, not the data being broken, and it was
+rejecting roughly 9% of pump.fun curves.
+
+So `check_curve_opening` asks the weaker question that survives dropping the
+constants: is this opening *structurally possible*? And the honest answer to
+"can a single row prove itself wrong without them?" is **no**. A curve's four
+reserves determine its own opening exactly (see `CurveOpening`), so k against
+that opening holds by construction -- the test is circular. What is left is
+positivity, and nothing else.
+
+Information about a curve that matches no known constant has to come from
+outside the row, and there are three places it can come from:
+
+* **the population** -- bucket `virtual_quote - real_quote` across all curves.
+  A real opening is shared by thousands; a corrupted value is unique to its row.
+* **the curve's history** -- k is conserved, so k must not *move* for a given
+  curve between slots, whatever its value. This needs no constants at all and
+  is the strongest test available.
+* **the known constants** -- exact, but only for the openings the program uses
+  today, which is where this started.
+
+The first two are for an operator with the whole table, not for a decoder
+holding one account, which is why this module reports a nonstandard opening as
+a warning and leaves the verdict to whoever can see the population.
 """
 
 from __future__ import annotations
@@ -48,6 +75,138 @@ class Violation:
 
     def __str__(self) -> str:
         return f"{self.name}: {self.detail}"
+
+
+@dataclass(frozen=True)
+class CurveOpening:
+    """A pump.fun curve's own opening parameters, recovered from its reserves.
+
+    The program moves each virtual reserve in lockstep with its real
+    counterpart -- a buy subtracts the same token amount from
+    ``virtual_token_reserves`` and ``real_token_reserves``, and adds the same
+    quote amount to ``virtual_quote_reserves`` and ``real_quote_reserves``.
+    So two differences are fixed for the curve's whole life, and both of them
+    are opening parameters:
+
+        quote_seed = virtual_quote - real_quote  == initial_virtual_quote_reserves
+        base_floor = virtual_base  - real_base   == initial_virtual_token_reserves
+                                                    - initial_real_token_reserves
+
+    `base_floor` is also the virtual base the curve ends on, which is why the
+    graduation price is ``(quote_seed + raise) / base_floor``.
+
+    Given those two, the opening k is ``(base_floor + initial_real_base) *
+    quote_seed``, and since k is conserved that inverts to
+
+        initial_real_base = virtual_base * virtual_quote / quote_seed - base_floor
+
+    so a curve states its entire opening without the Global account.
+    """
+
+    quote_seed: int
+    base_floor: int
+    implied_initial_real_base: Optional[int]
+    #: False when real_quote is zero -- the curve has not traded, so its
+    #: reserves carry no evidence about k and self-consistency is vacuous.
+    traded: bool
+
+    @property
+    def initial_virtual_base(self) -> Optional[int]:
+        if self.implied_initial_real_base is None:
+            return None
+        return self.base_floor + self.implied_initial_real_base
+
+
+def curve_opening(
+    virtual_base: Optional[int],
+    virtual_quote: Optional[int],
+    real_base: Optional[int],
+    real_quote: Optional[int],
+) -> Optional[CurveOpening]:
+    """Recover a curve's opening from its four reserve fields alone.
+
+    Returns None when a field is missing. Note this needs all four: the two
+    virtual reserves say where the curve is, the two real ones say how far it
+    has come, and only together do they say where it started.
+    """
+    if virtual_base is None or virtual_quote is None:
+        return None
+    if real_base is None or real_quote is None:
+        return None
+
+    quote_seed = virtual_quote - real_quote
+    base_floor = virtual_base - real_base
+    implied_initial_real_base = None
+    if quote_seed > 0:
+        implied_initial_real_base = (virtual_base * virtual_quote) // quote_seed - base_floor
+    return CurveOpening(
+        quote_seed=quote_seed,
+        base_floor=base_floor,
+        implied_initial_real_base=implied_initial_real_base,
+        traded=real_quote > 0,
+    )
+
+
+def check_curve_opening(
+    opening: Optional[CurveOpening],
+    token_total_supply: Optional[int] = None,
+) -> List[Violation]:
+    """Is a curve's recovered opening structurally possible?
+
+    This is what survives when the program's *current* opening constants are
+    not assumed. It asks only what must be true of any constant-product curve
+    the program could have created, so it cannot reject a curve merely for
+    having been seeded differently from today's default.
+
+    That matters: a launchpad that changes its opening reserves, or seeds a
+    different opening per quote mint, leaves a large population of curves that
+    are entirely correct and match no current constant. Judging those against
+    today's Global rejects real data.
+    """
+    violations: List[Violation] = []
+    if opening is None:
+        return violations
+
+    if opening.quote_seed <= 0:
+        violations.append(
+            Violation(
+                "quote_seed_not_positive",
+                f"virtual_quote - real_quote is {opening.quote_seed}, but the "
+                f"virtual quote reserve is seeded above zero and then tracks the "
+                f"real one exactly, so the difference is positive for life. A "
+                f"value at or below zero is what a virtual column carrying the "
+                f"REAL reserve looks like",
+            )
+        )
+    if opening.base_floor <= 0:
+        violations.append(
+            Violation(
+                "base_floor_not_positive",
+                f"virtual_base - real_base is {opening.base_floor}; the curve "
+                f"keeps virtual base above real base for life, so this pair did "
+                f"not come from one account read",
+            )
+        )
+
+    implied = opening.implied_initial_real_base
+    if implied is not None and opening.quote_seed > 0 and opening.base_floor > 0:
+        if implied <= 0:
+            violations.append(
+                Violation(
+                    "implied_opening_impossible",
+                    f"the reserves imply the curve opened with {implied} sellable "
+                    f"tokens, which cannot be",
+                )
+            )
+        elif token_total_supply and implied > token_total_supply:
+            violations.append(
+                Violation(
+                    "implied_opening_exceeds_supply",
+                    f"the reserves imply the curve opened with {implied} sellable "
+                    f"tokens against a total supply of {token_total_supply}",
+                )
+            )
+    return violations
 
 
 def classify_variant(
@@ -85,27 +244,39 @@ def check_reserve_offset(
     real_quote: Optional[int],
     candidates: Dict[str, int],
 ) -> List[Violation]:
-    """Flag a curve whose virtual/real quote difference matches no opening.
+    """Report a curve whose virtual/real quote difference matches no opening.
 
-    An offset of roughly zero is the signature of the virtual column carrying
-    the *real* reserve -- the two are then the same number, or the real one was
-    defaulted away.
+    This is a *warning*, not an error, and the distinction was learned the hard
+    way. The difference is exactly the curve's opening quote reserve, so it is
+    a reliable classifier -- but only against the openings the program is using
+    today. A launchpad that has changed its seed, or that seeds per quote mint,
+    leaves a large population of curves whose opening is real and simply not in
+    the candidate list. Treating those as corrupt rejects correct data, and at
+    scale it rejects a lot of it.
+
+    An offset at or below zero is different in kind: no opening can be zero or
+    negative, so that one is structurally impossible rather than merely
+    unfamiliar. `check_curve_opening` raises it as an error.
     """
     variant, offset = classify_variant(virtual_quote, real_quote, candidates)
-    if variant is not None or offset is None:
+    if variant is not None or offset is None or offset <= 0:
+        # offset <= 0 is check_curve_opening's to report, as an error.
         return []
     known = ", ".join(f"{name}={value}" for name, value in candidates.items() if value)
-    detail = (
-        f"virtual_quote - real_quote is {offset}, which matches no opening "
-        f"constant ({known}). That difference is fixed for a curve's whole life, "
-        f"so this pair did not come from one read"
-    )
-    if virtual_quote is not None and abs(offset) < min(v for v in candidates.values() if v) // 2:
-        detail += (
-            "; an offset near zero is what a virtual column carrying the REAL "
-            "reserve looks like"
+    return [
+        Violation(
+            "nonstandard_opening",
+            f"virtual_quote - real_quote is {offset}, which matches no opening "
+            f"constant the program uses today ({known}). That difference is the "
+            f"curve's own opening quote reserve, fixed for its whole life, so "
+            f"the curve is priced against {offset} here rather than against the "
+            f"default. Whether that opening is real or the row is corrupt cannot "
+            f"be told from this row: bucket the value across the population, "
+            f"because a real opening is shared by many curves and a corrupt one "
+            f"is unique to its row",
+            severity="warning",
         )
-    return [Violation("reserve_offset_mismatch", detail)]
+    ]
 
 
 def check_constant_product_pair(
@@ -277,10 +448,13 @@ def check_metrics(metrics, *, tolerance: float = K_TOLERANCE) -> List[Violation]
 
     if metrics.curve_family is CurveFamily.CONSTANT_PRODUCT_VIRTUAL:
         state = metrics.raw_state or {}
+        quote = state.get("virtual_quote_reserves")
+        if quote is None:
+            quote = state.get("virtual_sol_reserves")
         violations.extend(
             check_constant_product_pair(
                 state.get("virtual_token_reserves"),
-                state.get("virtual_quote_reserves") or state.get("virtual_sol_reserves"),
+                quote,
                 state.get("_initial_virtual_base"),
                 state.get("_initial_virtual_quote"),
                 tolerance=tolerance,

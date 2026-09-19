@@ -222,21 +222,65 @@ func TestGoldenMeteoraDbcMatchesThePythonReference(t *testing.T) {
 	}
 }
 
-func TestGoldenAnomalyIsRejected(t *testing.T) {
-	// The production row must not be published as a price, in either language.
+// brokenVectors are the pump.fun cases that must not publish a price, in
+// either language. Everything else in the section must come back clean.
+//
+// The anomaly vector is deliberately NOT here. Given all four reserves a curve
+// states its own opening, so k against that opening holds by construction and
+// the row cannot prove itself wrong -- calling it broken was the check
+// over-reaching, on roughly 9% of real pump.fun curves.
+var brokenVectors = map[string]string{
+	"stale_base_against_a_known_opening":    "k_violation",
+	"virtual_column_holds_the_real_reserve": "quote_seed_not_positive",
+}
+
+func TestGoldenBrokenCurvesAreRejected(t *testing.T) {
+	seen := 0
+	for _, tc := range goldenSection(t, "pumpfun") {
+		want, broken := brokenVectors[tc.Name]
+		if !broken {
+			continue
+		}
+		seen++
+		m, _ := decodePumpfunGolden(t, tc)
+		if m.OK() {
+			t.Errorf("%s: should not report OK", tc.Name)
+		}
+		if m.PriceSource != "SUSPECT" {
+			t.Errorf("%s: price source = %q, want SUSPECT", tc.Name, m.PriceSource)
+		}
+		found := false
+		for _, v := range m.Violations {
+			if v.Name == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("%s: want a %s violation, got %v", tc.Name, want, m.Violations)
+		}
+	}
+	if seen != len(brokenVectors) {
+		t.Fatalf("saw %d broken vectors, expected %d", seen, len(brokenVectors))
+	}
+}
+
+func TestGoldenUnfamiliarOpeningIsReportedButStillPriced(t *testing.T) {
 	for _, tc := range goldenSection(t, "pumpfun") {
 		if tc.Name != "field_mixing_anomaly" {
 			continue
 		}
 		m, _ := decodePumpfunGolden(t, tc)
-		if m.OK() {
-			t.Fatal("the k-violating pair should not report OK")
+		if !m.OK() {
+			t.Errorf("an unfamiliar opening is not a broken row: %v", m.Violations)
 		}
-		if m.PriceSource != "SUSPECT" {
-			t.Errorf("price source = %q, want SUSPECT", m.PriceSource)
+		if m.PriceSource == "SUSPECT" {
+			t.Error("the price should still be published")
 		}
-		if m.SuspectField != "virtual_quote" {
-			t.Errorf("suspect field = %q, want virtual_quote", m.SuspectField)
+		if m.CurveType != "constant_product:measured" {
+			t.Errorf("curve type = %q, want constant_product:measured", m.CurveType)
+		}
+		if len(m.Violations) != 1 || m.Violations[0].Name != "nonstandard_opening" {
+			t.Errorf("want one nonstandard_opening, got %v", m.Violations)
 		}
 		return
 	}
@@ -245,7 +289,7 @@ func TestGoldenAnomalyIsRejected(t *testing.T) {
 
 func TestGoldenHealthyCurvesAreOK(t *testing.T) {
 	for _, tc := range goldenSection(t, "pumpfun") {
-		if tc.Name == "field_mixing_anomaly" {
+		if _, broken := brokenVectors[tc.Name]; broken {
 			continue
 		}
 		if m, _ := decodePumpfunGolden(t, tc); !m.OK() {

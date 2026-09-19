@@ -171,13 +171,13 @@ docs/
 scripts/
   launchpads.py             CLI
   live_node_example.py      live-feed wiring
-tests/                      168 tests, no network
+tests/                      170 tests, no network
 ```
 
 ## Go
 
 `go/` is a production port: the decode path and curve maths in Go, standard
-library only, ~150 ns and zero allocations per curve. Account layouts for all
+library only, ~190 ns and zero allocations per curve. Account layouts for all
 eight launchpads are *generated* from the same IDL snapshots (`python
 scripts/gen_go.py`), and metrics adapters are written for pump.fun, Raydium
 LaunchLab and Meteora DBC.
@@ -193,8 +193,8 @@ here and runs out of band.
 
 ```bash
 pip install pytest
-python -m pytest tests/ -q     # 168, offline
-(cd go && go test ./...)       # 52, offline
+python -m pytest tests/ -q     # 170, offline
+(cd go && go test ./...)       # 56, offline
 ```
 
 They run entirely offline against synthetic, byte-exact fixtures built by a

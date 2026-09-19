@@ -1,6 +1,7 @@
 package launchpad
 
 import (
+	"encoding/binary"
 	"math"
 	"testing"
 )
@@ -270,8 +271,7 @@ func TestZeroesAreNotReportedAsViolations(t *testing.T) {
 // --------------------------------------------------------------------------
 
 func TestDecodingACurveDoesNotAllocate(t *testing.T) {
-	data := make([]byte, 8+125)
-	copy(data, DiscPumpfunBondingCurve[:])
+	data := freshCurveBytes()
 	var curve PumpfunBondingCurve
 	allocations := testing.AllocsPerRun(100, func() {
 		_, _ = DecodePumpfunBondingCurve(data, &curve)
@@ -306,12 +306,30 @@ func TestPricingAHealthyCurveDoesNotAllocate(t *testing.T) {
 	}
 }
 
-func BenchmarkDecodeAndPrice(b *testing.B) {
+// freshCurveBytes is an untouched pump.fun curve as the chain stores it.
+// Benchmarking against an all-zero buffer would time the error path instead,
+// which formats violation strings and is not what a serving path runs.
+func freshCurveBytes() []byte {
 	data := make([]byte, 8+125)
 	copy(data, DiscPumpfunBondingCurve[:])
+	for offset, value := range map[int]uint64{
+		8:  ivt,                   // virtual_token_reserves
+		16: ivs,                   // virtual_quote_reserves
+		24: irt,                   // real_token_reserves
+		32: 0,                     // real_quote_reserves
+		40: 1_000_000_000_000_000, // token_total_supply
+	} {
+		binary.LittleEndian.PutUint64(data[offset:], value)
+	}
+	return data
+}
+
+func BenchmarkDecodeAndPrice(b *testing.B) {
+	data := freshCurveBytes()
 	params := PumpfunParams{
 		InitialVirtualBase: ivt, InitialVirtualQuote: ivs,
 		InitialRealBase: irt, QuoteDecimals: 9, FromChain: true,
+		Variants: VariantCandidates{"sol": ivs},
 	}
 	params.derive()
 
@@ -365,12 +383,24 @@ func TestReserveOffsetReportsAnUnclassifiablePair(t *testing.T) {
 }
 
 func TestAVirtualColumnHoldingTheRealReserveIsNamedAsSuch(t *testing.T) {
-	violations := CheckReserveOffset(670_000_000, 670_000_000, variants())
-	if len(violations) != 1 || violations[0].Name != "reserve_offset_mismatch" {
-		t.Fatalf("got %v", violations)
+	// No curve opens at zero, so a virtual quote equal to its real counterpart
+	// is impossible rather than merely unfamiliar -- which is why this stays an
+	// error while a nonstandard opening does not.
+	opening := RecoverOpening(ivt, 670_000_000, irt, 670_000_000)
+	violations := CheckCurveOpening(opening, 1_000_000_000_000_000)
+	if len(violations) != 1 || violations[0].Name != "quote_seed_not_positive" {
+		t.Fatalf("want quote_seed_not_positive, got %v", violations)
+	}
+	if violations[0].Severity != SeverityError {
+		t.Errorf("severity = %q, want error", violations[0].Severity)
 	}
 	if !contains(violations[0].Detail, "carrying the REAL reserve") {
-		t.Errorf("detail should name the likely cause: %s", violations[0].Detail)
+		t.Errorf("detail should name the cause: %q", violations[0].Detail)
+	}
+	// And the unfamiliar-opening check stays out of its way: an impossible
+	// opening is not merely a nonstandard one.
+	if v := CheckReserveOffset(670_000_000, 670_000_000, variants()); v != nil {
+		t.Errorf("the offset check should defer to the opening check: %v", v)
 	}
 }
 
@@ -422,4 +452,80 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// --------------------------------------------------------------------------
+// a curve's own opening
+//
+// The correction field data forced: measured against a node, every stored
+// column held exactly the on-chain field its name claimed and 59 of 60 curves
+// still failed the old check. The check was over-reaching, on roughly 9% of
+// pump.fun curves.
+// --------------------------------------------------------------------------
+
+func TestACurveStatesItsOwnOpening(t *testing.T) {
+	// Walk a healthy curve away from its opening and check that both conserved
+	// differences hold, and that they recover the opening exactly.
+	for _, paid := range []uint64{0, 1_000_000_000, 42_500_000_000, 85_005_359_057} {
+		vQuote := ivs + paid
+		vBase := divU128ByU64(MulU64(ivt, ivs), vQuote)
+		rBase := irt - (ivt - vBase)
+
+		o := RecoverOpening(vBase, vQuote, rBase, paid)
+		if o.QuoteSeed != int64(ivs) {
+			t.Errorf("paid %d: quote seed = %d, want %d", paid, o.QuoteSeed, ivs)
+		}
+		if o.BaseFloor != int64(ivt-irt) {
+			t.Errorf("paid %d: base floor = %d, want %d", paid, o.BaseFloor, ivt-irt)
+		}
+		// Recovery is exact up to the program's own flooring: each trade floors
+		// the base reserve, and that dust is all that separates the recovered
+		// opening from the real one. A few base units on 1e15 is parts per
+		// hundred trillion.
+		if got := o.InitialVirtualBase(); diffU64(got, ivt) > 16 {
+			t.Errorf("paid %d: recovered opening base = %d, want %d", paid, got, ivt)
+		}
+		if v := CheckCurveOpening(o, 1_000_000_000_000_000); v != nil {
+			t.Errorf("paid %d: healthy curve flagged: %v", paid, v)
+		}
+	}
+}
+
+func TestAnUnfamiliarOpeningIsAWarningNotAnError(t *testing.T) {
+	// 18.2 SOL matches neither seeded constant, but it is a possible opening.
+	o := RecoverOpening(1_077_887_039_606_396, 18_204_928_211, irt, 1)
+	if v := CheckCurveOpening(o, 1_000_000_000_000_000); v != nil {
+		t.Fatalf("a possible opening is not a structural failure: %v", v)
+	}
+	violations := CheckReserveOffset(18_204_928_211, 1, variants())
+	if len(violations) != 1 || violations[0].Name != "nonstandard_opening" {
+		t.Fatalf("want nonstandard_opening, got %v", violations)
+	}
+	if violations[0].Severity != SeverityWarning {
+		t.Errorf("severity = %q, want warning -- an error here rejects correct data",
+			violations[0].Severity)
+	}
+}
+
+func TestAnImpliedOpeningAboveTotalSupplyIsRejected(t *testing.T) {
+	// A tiny quote seed implies the curve opened holding more tokens than the
+	// mint ever had, which no curve can do.
+	o := RecoverOpening(ivt, 1_000_000, irt, 1)
+	if o.ImpliedInitialRealBase <= 1_000_000_000_000_000 {
+		t.Skip("fixture no longer implies an oversized opening")
+	}
+	violations := CheckCurveOpening(o, 1_000_000_000_000_000)
+	if len(violations) != 1 || violations[0].Name != "implied_opening_exceeds_supply" {
+		t.Fatalf("want implied_opening_exceeds_supply, got %v", violations)
+	}
+}
+
+func TestRecoveringAnOpeningDoesNotAllocate(t *testing.T) {
+	allocations := testing.AllocsPerRun(100, func() {
+		o := RecoverOpening(ivt, ivs, irt, 0)
+		_ = CheckCurveOpening(o, 1_000_000_000_000_000)
+	})
+	if allocations != 0 {
+		t.Errorf("recovering an opening allocated %.0f times per run, want 0", allocations)
+	}
 }

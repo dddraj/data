@@ -2,8 +2,8 @@ package launchpad
 
 import (
 	"fmt"
-	"math"
 	"math/big"
+	"math/bits"
 )
 
 // Self-consistency checks on decoded curve state.
@@ -162,15 +162,21 @@ func DiagnosePair(virtualBase, virtualQuote, initialBase, initialQuote, baseForS
 
 // divU128ByU64 floors a 128-bit value by a 64-bit divisor.
 //
-// Only reached once a violation has already been found, so clarity beats
-// speed: big.Int has no overflow corner to get wrong, unlike a hand-rolled
-// long division whose remainder can overflow for a large divisor.
+// The two fast paths cover every curve in practice and allocate nothing, which
+// matters because recovering a curve's opening runs on the hot path. bits.Div64
+// panics when the quotient would not fit, so it is guarded by the exact
+// condition that makes it safe; the big.Int fallback is for values that cannot
+// arise from a real curve but must not panic if they do.
 func divU128ByU64(value U128, divisor uint64) uint64 {
 	if divisor == 0 {
 		return 0
 	}
 	if value.Hi == 0 {
 		return value.Lo / divisor
+	}
+	if value.Hi < divisor {
+		quotient, _ := bits.Div64(value.Hi, value.Lo, divisor)
+		return quotient
 	}
 	n := new(big.Int).Lsh(new(big.Int).SetUint64(value.Hi), 64)
 	n.Or(n, new(big.Int).SetUint64(value.Lo))
@@ -211,40 +217,159 @@ func ClassifyVariant(virtualQuote, realQuote uint64, candidates VariantCandidate
 	return "", offset
 }
 
-// CheckReserveOffset flags a curve whose virtual/real quote difference matches
-// no opening constant.
+// CheckReserveOffset reports a curve whose virtual/real quote difference
+// matches no opening constant.
 //
-// An offset near zero is the signature of the virtual column carrying the
-// *real* reserve: the two are then the same number, or the real one was
-// defaulted away by a later write on the same key.
+// This is a WARNING, not an error, and the distinction was learned from field
+// data. The difference is exactly the curve's opening quote reserve, which
+// makes it an exact classifier -- but only against the openings the program
+// uses today. A launchpad that has changed its seed, or seeds one per quote
+// mint, leaves a large population of curves whose opening is real and simply
+// not in the candidate list. Measured against a node on 60 sampled curves,
+// every stored column held exactly the on-chain field its name claimed and 59
+// still failed the old error-level check. That was the check over-reaching, on
+// roughly 9% of pump.fun curves.
+//
+// An offset at or below zero is different in kind: no curve opens at zero, so
+// that is impossible rather than unfamiliar, and CheckCurveOpening raises it
+// as an error.
 func CheckReserveOffset(virtualQuote, realQuote uint64, candidates VariantCandidates) []Violation {
 	if len(candidates) == 0 {
 		return nil
 	}
 	variant, offset := ClassifyVariant(virtualQuote, realQuote, candidates)
-	if variant != "" {
+	if variant != "" || offset <= 0 {
 		return nil
 	}
-
-	smallest := uint64(math.MaxUint64)
-	for _, initial := range candidates {
-		if initial != 0 && initial < smallest {
-			smallest = initial
-		}
-	}
-	detail := fmt.Sprintf(
-		"virtual_quote - real_quote is %d, which matches no opening constant. "+
-			"That difference is fixed for a curve's whole life, so this pair did "+
-			"not come from one read", offset)
-	if abs64(offset) < int64(smallest/2) {
-		detail += "; an offset near zero is what a virtual column carrying the REAL reserve looks like"
-	}
-	return []Violation{{Name: "reserve_offset_mismatch", Detail: detail, Severity: SeverityError}}
+	return []Violation{{
+		Name: "nonstandard_opening",
+		Detail: fmt.Sprintf(
+			"virtual_quote - real_quote is %d, which matches no opening constant "+
+				"the program uses today. That difference is the curve's own opening "+
+				"quote reserve, fixed for its whole life, so the curve is priced "+
+				"against %d here rather than against the default. Whether that "+
+				"opening is real or the row is corrupt cannot be told from this row: "+
+				"bucket the value across the population, because a real opening is "+
+				"shared by many curves and a corrupt one is unique to its row",
+			offset, offset),
+		Severity: SeverityWarning,
+	}}
 }
 
-func abs64(v int64) int64 {
-	if v < 0 {
-		return -v
+// CurveOpening is a pump.fun curve's own opening parameters, recovered from its
+// four reserve fields.
+//
+// The program moves each virtual reserve in lockstep with its real
+// counterpart, so two differences are fixed for the curve's whole life and both
+// of them are opening parameters:
+//
+//	QuoteSeed = virtual_quote - real_quote == initial_virtual_quote_reserves
+//	BaseFloor = virtual_base  - real_base  == initial_virtual_token_reserves
+//	                                          - initial_real_token_reserves
+//
+// BaseFloor is also the virtual base the curve ends on, which is why the
+// graduation price is (QuoteSeed + raise) / BaseFloor.
+//
+// Since k is conserved, the opening inverts out of those two:
+//
+//	initial_real_base = virtual_base * virtual_quote / QuoteSeed - BaseFloor
+//
+// So a curve states its entire opening without the Global account -- and, note,
+// k against that opening then holds by construction. A single row cannot prove
+// itself wrong once the program's constants are not assumed; only positivity is
+// left. The evidence has to come from the population (bucket QuoteSeed across
+// all curves: a real opening is shared by thousands) or from the curve's own
+// history (k must not move between slots).
+type CurveOpening struct {
+	QuoteSeed int64
+	BaseFloor int64
+	// ImpliedInitialRealBase is zero when QuoteSeed is not positive.
+	ImpliedInitialRealBase uint64
+	// Traded is false when real_quote is zero: the curve carries no evidence
+	// about k at all, so self-consistency is doubly vacuous.
+	Traded bool
+	// OK is false when a field was missing and nothing could be recovered.
+	OK bool
+}
+
+// InitialVirtualBase is the virtual base the curve opened with.
+func (o CurveOpening) InitialVirtualBase() uint64 {
+	if !o.OK || o.BaseFloor <= 0 {
+		return 0
 	}
-	return v
+	return uint64(o.BaseFloor) + o.ImpliedInitialRealBase
+}
+
+// RecoverOpening derives a curve's opening from its four reserves. It needs all
+// four: the virtual pair says where the curve is, the real pair says how far it
+// has come, and only together do they say where it started.
+func RecoverOpening(virtualBase, virtualQuote, realBase, realQuote uint64) CurveOpening {
+	o := CurveOpening{
+		QuoteSeed: int64(virtualQuote) - int64(realQuote),
+		BaseFloor: int64(virtualBase) - int64(realBase),
+		Traded:    realQuote > 0,
+		OK:        true,
+	}
+	if o.QuoteSeed > 0 {
+		k := MulU64(virtualBase, virtualQuote)
+		implied := int64(divU128ByU64(k, uint64(o.QuoteSeed))) - o.BaseFloor
+		if implied > 0 {
+			o.ImpliedInitialRealBase = uint64(implied)
+		}
+	}
+	return o
+}
+
+// CheckCurveOpening asks the one question that survives dropping the program's
+// constants: is this opening structurally possible?
+//
+// It cannot reject a curve merely for having been seeded differently from
+// today's default, which is the whole point -- that rejection was wrong, and at
+// scale it was wrong about a lot of correct data.
+func CheckCurveOpening(o CurveOpening, tokenTotalSupply uint64) []Violation {
+	if !o.OK {
+		return nil
+	}
+	var out []Violation
+	if o.QuoteSeed <= 0 {
+		out = append(out, Violation{
+			Name: "quote_seed_not_positive",
+			Detail: fmt.Sprintf(
+				"virtual_quote - real_quote is %d, but the virtual quote reserve is "+
+					"seeded above zero and then tracks the real one exactly, so the "+
+					"difference is positive for life. A value at or below zero is what "+
+					"a virtual column carrying the REAL reserve looks like", o.QuoteSeed),
+			Severity: SeverityError,
+		})
+	}
+	if o.BaseFloor <= 0 {
+		out = append(out, Violation{
+			Name: "base_floor_not_positive",
+			Detail: fmt.Sprintf(
+				"virtual_base - real_base is %d; the curve keeps virtual base above "+
+					"real base for life, so this pair did not come from one account read",
+				o.BaseFloor),
+			Severity: SeverityError,
+		})
+	}
+	if o.QuoteSeed > 0 && o.BaseFloor > 0 {
+		implied := o.ImpliedInitialRealBase
+		switch {
+		case implied == 0:
+			out = append(out, Violation{
+				Name:     "implied_opening_impossible",
+				Detail:   "the reserves imply the curve opened with no sellable tokens",
+				Severity: SeverityError,
+			})
+		case tokenTotalSupply > 0 && implied > tokenTotalSupply:
+			out = append(out, Violation{
+				Name: "implied_opening_exceeds_supply",
+				Detail: fmt.Sprintf(
+					"the reserves imply the curve opened with %d sellable tokens "+
+						"against a total supply of %d", implied, tokenTotalSupply),
+				Severity: SeverityError,
+			})
+		}
+	}
+	return out
 }

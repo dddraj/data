@@ -35,7 +35,17 @@ from typing import Dict, List, Optional
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from launchpad_decoder import JsonRpcAccountSource, LaunchpadDecoder  # noqa: E402
-from launchpad_decoder.discovery import derived_curve_address  # noqa: E402
+from launchpad_decoder.discovery import derived_curve_address
+from launchpad_decoder.invariants import curve_opening  # noqa: E402
+
+#: violation names that mean "no curve this program could create looks like this"
+_STRUCTURAL = (
+    "quote_seed_not_positive",
+    "base_floor_not_positive",
+    "implied_opening_impossible",
+    "implied_opening_exceeds_supply",
+    "k_violation",
+)
 
 #: columns that are identifiers rather than values to check
 ID_COLUMNS = {"mint", "curve", "curve_address", "address", "pool", "creator_program"}
@@ -65,6 +75,20 @@ def as_int(value: Optional[str]) -> Optional[int]:
             return None
 
 
+def first_present(state: Dict, *names: str) -> Optional[int]:
+    """First field that is present, absorbing the sol -> quote rename.
+
+    Deliberately not `a or b`: a real reserve of zero is the commonest value
+    on a fresh curve, and `0 or None` is None, which would quietly skip the
+    check on exactly the curves it should be looking at.
+    """
+    for name in names:
+        value = state.get(name)
+        if value is not None:
+            return value
+    return None
+
+
 def numeric_fields(state: Dict) -> Dict[str, int]:
     return {
         name: value
@@ -83,6 +107,14 @@ def audit(
     """Attribute each stored column to the on-chain field that holds its value."""
     attribution: Dict[str, Counter] = defaultdict(Counter)
     invariant_failures = 0
+    nonstandard = 0
+    # The histogram that decides whether an unfamiliar opening is real. The
+    # curve's opening quote reserve is exactly virtual_quote - real_quote, so
+    # bucketing it across the population separates the two explanations: a real
+    # opening is shared by thousands of curves, a corrupted value is unique to
+    # its own row.
+    opening_buckets: Counter = Counter()
+    base_floor_buckets: Counter = Counter()
     unreadable = 0
     examples: List[Dict] = []
 
@@ -122,9 +154,27 @@ def audit(
                 attribution[column]["<no on-chain field holds this value>"] += 1
                 mismatched[column] = stored
 
+        opening = curve_opening(
+            first_present(state, "virtual_token_reserves"),
+            first_present(state, "virtual_quote_reserves", "virtual_sol_reserves"),
+            first_present(state, "real_token_reserves"),
+            first_present(state, "real_quote_reserves", "real_sol_reserves"),
+        )
+        if opening is not None:
+            opening_buckets[opening.quote_seed] += 1
+            base_floor_buckets[opening.base_floor] += 1
+
         metrics = decoder.decode(account)
-        if metrics and any("k_violation" in w for w in metrics.warnings):
+        warnings = metrics.warnings if metrics else []
+        # Two different findings, and conflating them is what sends an
+        # investigation after the pipeline when the chain is the answer.
+        # A structural failure is impossible on any curve the program could
+        # have created. A nonstandard opening is merely one this build of the
+        # program would not create today, which an older build may well have.
+        if any(name in w for w in warnings for name in _STRUCTURAL):
             invariant_failures += 1
+        if any("nonstandard_opening" in w for w in warnings):
+            nonstandard += 1
 
         if mismatched and len(examples) < show_mismatches:
             examples.append(
@@ -140,6 +190,9 @@ def audit(
         "rows_checked": len(rows) - unreadable,
         "rows_unreadable": unreadable,
         "rows_failing_curve_invariant_on_chain": invariant_failures,
+        "rows_with_a_nonstandard_opening": nonstandard,
+        "opening_buckets": dict(opening_buckets.most_common(20)),
+        "base_floor_buckets": dict(base_floor_buckets.most_common(20)),
         "attribution": {col: dict(counts.most_common()) for col, counts in attribution.items()},
         "examples": examples,
     }
@@ -171,6 +224,7 @@ def main() -> None:
     report = audit(decoder, rows, args.program, show_mismatches=args.show_mismatches)
     unreadable = report["rows_unreadable"]
     invariant_failures = report["rows_failing_curve_invariant_on_chain"]
+    nonstandard = report["rows_with_a_nonstandard_opening"]
     examples = report["examples"]
 
     if args.json:
@@ -179,9 +233,28 @@ def main() -> None:
 
     print(f"checked {report['rows_checked']} rows ({unreadable} unreadable)")
     print(
-        f"rows whose ON-CHAIN state fails the curve invariant: {invariant_failures} "
-        "(if this is ~0, the chain is fine and the disagreement is in the pipeline)\n"
+        f"rows whose ON-CHAIN state is structurally impossible: {invariant_failures}\n"
+        f"rows whose opening matches no constant this program build uses: {nonstandard}\n"
     )
+    print(
+        "    The first number is a real defect wherever it is not zero. The second\n"
+        "    is NOT: an older build, or a per-quote-mint seed, produces curves that\n"
+        "    are entirely correct and match nothing in today's config. The buckets\n"
+        "    below decide which you have -- a real opening is shared by thousands of\n"
+        "    curves, a corrupted one is unique to its row.\n"
+    )
+    for label, key in (
+        ("opening quote reserve (virtual_quote - real_quote)", "opening_buckets"),
+        ("opening base gap (virtual_base - real_base)", "base_floor_buckets"),
+    ):
+        buckets = report[key]
+        if not buckets:
+            continue
+        total = sum(buckets.values())
+        print(f"{label}, most common first:")
+        for value, count in buckets.items():
+            print(f"    {value:>24,}  {count:>8,}  {count / total:>6.1%}")
+        print()
     for column, counts in report["attribution"].items():
         total = sum(counts.values())
         print(f"stored column `{column}` actually holds:")

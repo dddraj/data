@@ -20,9 +20,11 @@ from launchpad_decoder import LaunchpadDecoder, StaticAccountSource, pdas  # noq
 from launchpad_decoder.anchor_idl import compile_idl  # noqa: E402
 from launchpad_decoder.invariants import (  # noqa: E402
     check_constant_product_pair,
+    check_curve_opening,
     check_metrics,
     check_reserve_offset,
     classify_variant,
+    curve_opening,
     diagnose_pair,
 )
 from launchpad_decoder.registry import get as get_spec  # noqa: E402
@@ -144,14 +146,41 @@ def test_decoder_stays_silent_on_a_healthy_curve():
     assert "SUSPECT" not in m.current_price_quote.note
 
 
-def test_decoder_flags_the_production_anomaly_and_names_the_suspect_field():
-    m = decode_curve(FIELD_ANOMALY_BASE, FIELD_ANOMALY_QUOTE)
+def test_a_classified_curve_off_its_own_k_is_still_an_error():
+    """Where the check keeps its teeth, and the shape a stale lane really has.
+
+    This curve's opening IS one of the program's own constants -- the quote
+    side moved in lockstep, so it classifies as the 30 SOL variant. But the
+    base reserve did not move with it, which is what a second writer emitting
+    a partial row looks like. The opening is known, so k must hold, and it
+    does not.
+    """
+    paid = 5_000_000_000
+    m = decode_curve(IVT, IVS + paid, real_quote_reserves=paid)
     joined = " ".join(m.warnings)
     assert "k_violation" in joined
-    assert "suspect field: virtual_quote" in joined
     assert "SUSPECT" in m.current_price_quote.note
-    # the price is still reported -- flagged, not silently dropped
-    assert m.current_price_quote.value == pytest.approx(1.688946e-08, rel=1e-4)
+    assert m.curve_type == "constant_product:sol"
+    # Both reserves are individually inside their legal range here, so neither
+    # is provably the culprit; the check says so rather than guessing.
+    assert "suspect field:" not in joined
+
+
+def test_the_same_pair_with_a_real_reserve_is_reported_as_unfamiliar_not_broken():
+    """The correction the field data forced.
+
+    Given all four reserves, a curve states its own opening exactly, so k
+    against that opening holds by construction and cannot fail. Calling such a
+    row broken is the check over-reaching -- which, measured against a node,
+    it was doing on roughly 9% of pump.fun curves whose columns were verified
+    faithful. It is reported, and the price is still published.
+    """
+    m = decode_curve(FIELD_ANOMALY_BASE, FIELD_ANOMALY_QUOTE, real_quote_reserves=1)
+    joined = " ".join(m.warnings)
+    assert "nonstandard_opening" in joined
+    assert "k_violation" not in joined
+    assert "SUSPECT" not in m.current_price_quote.note
+    assert m.curve_type == "constant_product:measured"
 
 
 def test_the_flagged_price_is_the_one_that_would_have_been_wrong():
@@ -210,10 +239,19 @@ def test_reserve_offset_reports_an_unclassifiable_pair():
 
 
 def test_a_virtual_column_holding_the_real_reserve_is_named_as_such():
-    """The residual signature: the two columns carry the same number."""
-    violations = check_reserve_offset(670_000_000, 670_000_000, CANDIDATES)
-    assert [v.name for v in violations] == ["reserve_offset_mismatch"]
+    """The one signature that survives dropping the constants.
+
+    No curve can open at zero, so a virtual quote equal to its real
+    counterpart is impossible rather than merely unfamiliar -- which is why
+    this stays an error while a nonstandard opening does not.
+    """
+    opening = curve_opening(IVT, 670_000_000, IRT, 670_000_000)
+    violations = check_curve_opening(opening)
+    assert [v.name for v in violations] == ["quote_seed_not_positive"]
     assert "carrying the REAL reserve" in violations[0].detail
+    assert violations[0].severity == "error"
+    # and the unfamiliar-opening check stays out of its way
+    assert check_reserve_offset(670_000_000, 670_000_000, CANDIDATES) == []
 
 
 def test_a_healthy_curve_raises_no_offset_violation():
@@ -286,9 +324,10 @@ def test_decoder_still_prices_a_sol_variant_curve_the_same_way():
 
 
 def test_decoder_flags_the_residual_signature():
-    """virtual_quote carrying the real reserve: offset collapses to zero."""
+    """virtual_quote carrying the real reserve: the opening collapses to zero."""
     m = decode_with_variants(670_000_000, 670_000_000)
     joined = " ".join(m.warnings)
-    assert "reserve_offset_mismatch" in joined
+    assert "quote_seed_not_positive" in joined
     assert "carrying the REAL reserve" in joined
     assert m.curve_type == "constant_product:unclassified"
+    assert "SUSPECT" in m.current_price_quote.note

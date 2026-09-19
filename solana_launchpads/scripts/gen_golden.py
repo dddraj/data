@@ -51,7 +51,11 @@ VIOLATION_NAMES = (
     "k_violation",
     "quote_below_open",
     "base_above_open",
-    "reserve_offset_mismatch",
+    "nonstandard_opening",
+    "quote_seed_not_positive",
+    "base_floor_not_positive",
+    "implied_opening_impossible",
+    "implied_opening_exceeds_supply",
 )
 
 
@@ -144,6 +148,7 @@ def pumpfun_cases() -> list:
     mid_quote = IVS + paid
     mid_base = (IVT * IVS) // mid_quote
     sold = IVT - mid_base
+    variant_base = (IVT * 4_292_000_000) // 9_292_000_000
 
     return [
         pumpfun_case(
@@ -182,13 +187,42 @@ def pumpfun_cases() -> list:
         ),
         pumpfun_case(
             "field_mixing_anomaly",
-            "the row a peer session measured in production: vBase*vQuote is 61% of k, "
-            "so the two reserves did not come from one read",
+            "the row a peer session measured in production. Given all four "
+            "reserves this states an unfamiliar opening rather than a broken "
+            "one -- k against a curve's own opening holds by construction -- so "
+            "it is reported and still priced",
             {
                 "virtual_token_reserves": 1_077_887_039_606_396,
                 "virtual_quote_reserves": 18_204_928_211,
                 "real_token_reserves": IRT,
                 "real_quote_reserves": 1,
+                "token_total_supply": SUPPLY,
+            },
+        ),
+        pumpfun_case(
+            "stale_base_against_a_known_opening",
+            "the shape a second writer emitting a partial row really has: the "
+            "quote side moved in lockstep so the curve classifies as the 30 SOL "
+            "variant, but the base did not move with it. The opening is known, "
+            "so k must hold, and it does not",
+            {
+                "virtual_token_reserves": IVT,
+                "virtual_quote_reserves": IVS + 5_000_000_000,
+                "real_token_reserves": IRT,
+                "real_quote_reserves": 5_000_000_000,
+                "token_total_supply": SUPPLY,
+            },
+        ),
+        pumpfun_case(
+            "virtual_column_holds_the_real_reserve",
+            "the one signature that survives dropping the constants: no curve "
+            "opens at zero, so a virtual quote equal to its real counterpart is "
+            "impossible rather than merely unfamiliar",
+            {
+                "virtual_token_reserves": IVT,
+                "virtual_quote_reserves": 670_000_000,
+                "real_token_reserves": IRT,
+                "real_quote_reserves": 670_000_000,
                 "token_total_supply": SUPPLY,
             },
         ),
@@ -210,9 +244,11 @@ def pumpfun_cases() -> list:
             "the same variant after trading, where a narrow band around the "
             "opening no longer finds it but the reserve offset still does",
             {
-                "virtual_token_reserves": (IVT * 4_292_000_000) // 9_292_000_000,
+                "virtual_token_reserves": variant_base,
                 "virtual_quote_reserves": 9_292_000_000,
-                "real_token_reserves": IRT - 100_000_000_000_000,
+                # the real base has to come down with the virtual one, or the
+                # curve holds more tokens than it has
+                "real_token_reserves": IRT - (IVT - variant_base),
                 "real_quote_reserves": 5_000_000_000,
                 "token_total_supply": SUPPLY,
             },

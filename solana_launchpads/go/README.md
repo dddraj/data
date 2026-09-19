@@ -85,11 +85,11 @@ reference is worthless, so divergence fails the build.
 
 Regenerate with `python scripts/gen_golden.py`.
 
-Sixteen vectors across the three adapters:
+Eighteen vectors across the three adapters:
 
 | launchpad | vectors |
 |---|---|
-| pump.fun | fresh, mid-curve, completed, legacy truncated account, both quote variants, and the field-mixing anomaly measured in production |
+| pump.fun | fresh, mid-curve, completed, legacy truncated account, both quote variants, an unfamiliar opening, a stale base against a known opening, and a virtual column carrying the real reserve |
 | Raydium LaunchLab | constant-product fresh/mid/migrated, fixed price, linear half sold |
 | Meteora DBC | fresh, mid, migrated, and a two-segment config with `migration_sqrt_price` left at zero |
 
@@ -107,8 +107,9 @@ itself.
 
 | check | launchpad | what it catches |
 |---|---|---|
+| `CheckCurveOpening` | pump.fun | an opening no curve could have had: zero, negative, or above total supply |
 | `CheckConstantProductPair` | pump.fun, LaunchLab | a reserve pair that is not on its own k |
-| `CheckReserveOffset` | pump.fun | `virtual_quote - real_quote` matching no opening constant |
+| `CheckReserveOffset` | pump.fun | an opening this program build does not use (warning) |
 | `CheckLaunchLabConstantProduct` | LaunchLab | real and virtual reserves from different reads |
 | `CheckDbcSqrtPrice` | Meteora DBC | a pool priced outside the band its config allows |
 
@@ -123,24 +124,47 @@ schema check and produces a confidently wrong price.
 each has travelled past its bound, and reports what the other implies it should
 have been.
 
-One limitation, stated in the code as well: the opening k comes from the
-program's config *as it stands now*. If a launchpad ever changed its opening
-reserves, curves created before the change sit on a different k and are flagged
-although they are correct. That false positive is a cluster of old curves all
-off by the same ratio; mixed fields scatter. Bucket the ratio to tell them
-apart.
+### What a single row cannot tell you
+
+There is a limit here, and it was found by measurement rather than reasoning.
+
+The opening k comes from the program's config *as it stands now*. Against a
+real node on 60 sampled pump.fun curves, every stored column held exactly the
+on-chain field its name claimed — and 59 of the 60 still failed that check. The
+chain was right; the check was over-reaching, on roughly 9% of curves.
+
+`RecoverOpening` is the fix: a curve's four reserves state its own opening
+exactly, because the program moves each virtual reserve in lockstep with its
+real counterpart. So the decoder prices a curve against the opening the curve
+itself claims, and reports an unfamiliar opening as a **warning**.
+
+But note what that costs. k against a curve's *own* opening holds by
+construction, so the test is circular and catches nothing. A single row cannot
+prove itself wrong once the program's constants are not assumed; only positivity
+survives. Real evidence has to come from outside the row:
+
+* **the population** — bucket `virtual_quote - real_quote` across every curve.
+  A real opening is shared by thousands of rows; a corrupted value is unique to
+  its own row. `scripts/audit_rows.py` prints this histogram.
+* **the curve's history** — k is conserved, so k must not *move* for a given
+  curve between slots, whatever its value. No constants needed, and it is the
+  strongest test available to anyone storing per-slot state.
+
+`CheckConstantProductPair` keeps its teeth where the opening *is* known: a
+curve that classifies against a seeded constant must sit on that constant's k,
+and a second writer emitting a partial row is exactly what breaks it.
 
 ## Tests
 
 ```sh
-go test ./...                              # 52 tests
+go test ./...                              # 56 tests
 go test -run=XXX -bench=. -benchmem ./...  # 0 allocs/op on every adapter
 ```
 
 ```
-BenchmarkDbcPrice-4         102.4 ns/op   0 B/op   0 allocs/op
-BenchmarkLaunchLabPrice-4   124.9 ns/op   0 B/op   0 allocs/op
-BenchmarkDecodeAndPrice-4   154.2 ns/op   0 B/op   0 allocs/op
+BenchmarkDbcPrice-4          86.9 ns/op   0 B/op   0 allocs/op
+BenchmarkLaunchLabPrice-4   116.4 ns/op   0 B/op   0 allocs/op
+BenchmarkDecodeAndPrice-4   186.5 ns/op   0 B/op   0 allocs/op
 ```
 
 The allocation budget is asserted, not just measured: `TestDecodingACurveDoesNotAllocate`,

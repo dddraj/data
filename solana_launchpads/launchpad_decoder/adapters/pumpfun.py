@@ -16,8 +16,10 @@ from typing import Any, Dict, Optional
 from .. import curves
 from ..invariants import (
     check_constant_product_pair,
+    check_curve_opening,
     check_reserve_offset,
     classify_variant,
+    curve_opening,
     diagnose_pair,
 )
 from ..types import CurveFamily, LaunchMetrics, ValueSource, price_raw_to_ui, ui_amount
@@ -103,12 +105,33 @@ class PumpFunAdapter(Adapter):
         }
         candidates = {k: v for k, v in candidates.items() if v}
         variant, init_v_quote = classify_variant(v_quote, real_quote, candidates)
-        if variant is None:
+
+        # When the difference matches no constant the program uses *today*, the
+        # curve still states its own opening -- the difference IS that opening.
+        # Prefer it over the config's: a curve seeded under an older or
+        # per-mint constant is correct, and judging it against today's Global
+        # prices it wrong and then reports the correct row as broken.
+        opening = curve_opening(v_base, v_quote, real_base, real_quote)
+        measured = False
+        if variant is None and opening is not None and opening.quote_seed > 0:
+            init_v_quote = opening.quote_seed
+            if opening.initial_virtual_base:
+                init_v_base = opening.initial_virtual_base
+            if opening.implied_initial_real_base:
+                init_real_base = opening.implied_initial_real_base
+            measured = True
+        elif variant is None:
             init_v_quote = candidates.get("sol") or next(iter(candidates.values()), None)
-        m.curve_type = f"constant_product:{variant or 'unclassified'}"
+
+        m.curve_type = "constant_product:" + (
+            variant or ("measured" if measured else "unclassified")
+        )
 
         m.tokens_for_sale = self.param(
-            ui_amount(init_real_base, m.base_decimals), cfg_source, cfg_slot
+            ui_amount(init_real_base, m.base_decimals),
+            ValueSource.DERIVED if measured else cfg_source,
+            ctx.slot if measured else cfg_slot,
+            "recovered from the curve's own reserves" if measured else "",
         )
         if real_base is not None and init_real_base is not None:
             m.tokens_sold = self.param(
@@ -185,20 +208,35 @@ class PumpFunAdapter(Adapter):
         # individually plausible but whose product is not k means the two
         # reserves did not come from the same read -- the price is wrong and
         # nothing else would catch it.
-        violations = check_constant_product_pair(
-            v_base, v_quote, init_v_base, init_v_quote
-        ) + check_reserve_offset(v_quote, real_quote, candidates)
+        #
+        # Two kinds of wrong, and only one of them is the row's fault. A pair
+        # that is not on *its own* curve is broken. A pair that is on its own
+        # curve but not on today's default opening is merely unfamiliar, and
+        # saying otherwise rejects every curve the program seeded differently.
+        violations = check_curve_opening(opening, total_supply_raw)
+        if measured:
+            # The opening came off the curve itself, so comparing k against it
+            # is circular -- it holds by construction. All that is left to say
+            # is which opening this curve claims, so an operator can bucket it
+            # across the population.
+            violations += check_reserve_offset(v_quote, real_quote, candidates)
+        else:
+            violations += check_constant_product_pair(
+                v_base, v_quote, init_v_base, init_v_quote
+            )
+        blocking = [v for v in violations if v.severity == "error"]
         if violations:
             m.raw_state = {
                 **state,
                 "_initial_virtual_base": init_v_base,
                 "_initial_virtual_quote": init_v_quote,
             }
+            for violation in violations:
+                m.warn(str(violation))
+        if blocking:
             suspect, explanation = diagnose_pair(
                 v_base, v_quote, init_v_base, init_v_quote, init_real_base
             )
-            for violation in violations:
-                m.warn(str(violation))
             if suspect:
                 m.warn(f"suspect field: {suspect} -- {explanation}")
             m.current_price_quote = self.param(

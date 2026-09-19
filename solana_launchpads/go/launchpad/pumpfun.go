@@ -73,6 +73,20 @@ func NewPumpfunParams(g *PumpfunGlobal, quoteDecimals int) PumpfunParams {
 	return p
 }
 
+// curveTypeName avoids concatenating on the hot path: the two real variants
+// and the two fallbacks are constants, so pricing a curve allocates nothing.
+func curveTypeName(variant string) string {
+	switch variant {
+	case "sol":
+		return "constant_product:sol"
+	case "quote":
+		return "constant_product:quote"
+	case "":
+		return "constant_product:unclassified"
+	}
+	return "constant_product:" + variant
+}
+
 func (p *PumpfunParams) derive() {
 	if p.InitialVirtualBase == 0 || p.InitialVirtualQuote == 0 {
 		return
@@ -100,17 +114,46 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 	// rather than assuming, or a non-SOL-quoted curve is priced against the
 	// SOL opening and every number comes out wrong.
 	variant, _ := ClassifyVariant(c.VirtualQuoteReserves, c.RealQuoteReserves, p.Variants)
-	openingQuote := p.InitialVirtualQuote
-	if variant != "" {
-		openingQuote = p.Variants[variant]
-	}
-	curveType := "constant_product:unclassified"
-	if variant != "" {
-		curveType = "constant_product:" + variant
-	}
 	derived := p
-	if openingQuote != p.InitialVirtualQuote {
-		derived.InitialVirtualQuote = openingQuote
+	curveType := curveTypeName(variant)
+
+	// When the difference matches no constant the program uses TODAY, the curve
+	// still states its own opening -- the difference IS that opening. Prefer it
+	// over the config's: a curve seeded under an older or per-mint constant is
+	// correct, and judging it against today's Global prices it wrong and then
+	// reports the correct row as broken.
+	opening := RecoverOpening(
+		c.VirtualTokenReserves, c.VirtualQuoteReserves,
+		c.RealTokenReserves, c.RealQuoteReserves)
+	measured := false
+	if variant == "" {
+		if opening.QuoteSeed > 0 {
+			measured = true
+			curveType = "constant_product:measured"
+			quote := uint64(opening.QuoteSeed)
+			base := opening.InitialVirtualBase()
+			realBase := opening.ImpliedInitialRealBase
+			// A consistent curve recovers exactly the opening the params
+			// already hold, so re-deriving would be identical work for an
+			// identical answer -- and re-deriving is the only thing on this
+			// path that allocates.
+			if quote != p.InitialVirtualQuote ||
+				(base > 0 && base != p.InitialVirtualBase) ||
+				(realBase > 0 && realBase != p.InitialRealBase) {
+				derived.InitialVirtualQuote = quote
+				if base > 0 {
+					derived.InitialVirtualBase = base
+				}
+				if realBase > 0 {
+					derived.InitialRealBase = realBase
+				}
+				derived.derive()
+			}
+		} else {
+			curveType = "constant_product:unclassified"
+		}
+	} else if p.Variants[variant] != p.InitialVirtualQuote {
+		derived.InitialVirtualQuote = p.Variants[variant]
 		derived.derive()
 	}
 
@@ -134,7 +177,7 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		BaseDecimals:  baseDec,
 		QuoteDecimals: quoteDec,
 		TotalSupply:   UIAmount(totalSupply, baseDec),
-		TokensForSale: UIAmount(p.InitialRealBase, baseDec),
+		TokensForSale: UIAmount(derived.InitialRealBase, baseDec),
 		Raised:        UIAmount(c.RealQuoteReserves, quoteDec),
 		RaiseTarget:   UIAmount(derived.RaiseTargetRaw, quoteDec),
 		Complete:      c.Complete,
@@ -150,19 +193,31 @@ func (p PumpfunParams) Metrics(c *PumpfunBondingCurve, truncatedAt string) Metri
 		m.CurrentPrice = PriceUI(
 			CPPriceRaw(c.VirtualQuoteReserves, c.VirtualTokenReserves), baseDec, quoteDec)
 	}
-	if p.InitialRealBase >= c.RealTokenReserves {
-		m.TokensSold = UIAmount(p.InitialRealBase-c.RealTokenReserves, baseDec)
+	if derived.InitialRealBase >= c.RealTokenReserves {
+		m.TokensSold = UIAmount(derived.InitialRealBase-c.RealTokenReserves, baseDec)
 	}
 
 	// Does the pair actually lie on the curve? A pair that is individually
 	// plausible but whose product is not k means the two reserves did not come
 	// from the same read, and nothing else would catch it.
-	m.Violations = CheckConstantProductPair(
-		c.VirtualTokenReserves, c.VirtualQuoteReserves,
-		derived.InitialVirtualBase, derived.InitialVirtualQuote)
-	m.Violations = append(m.Violations,
-		CheckReserveOffset(c.VirtualQuoteReserves, c.RealQuoteReserves, p.Variants)...)
-	if len(m.Violations) > 0 {
+	//
+	// Two kinds of wrong, and only one of them is the row's fault. A pair that
+	// is not on ITS OWN curve is broken. A pair that is on its own curve but
+	// not on today's default opening is merely unfamiliar, and saying otherwise
+	// rejects every curve the program seeded differently.
+	m.Violations = CheckCurveOpening(opening, totalSupply)
+	if measured {
+		// The opening came off the curve itself, so comparing k against it is
+		// circular -- it holds by construction. All that is left to say is
+		// which opening this curve claims, so it can be bucketed.
+		m.Violations = append(m.Violations,
+			CheckReserveOffset(c.VirtualQuoteReserves, c.RealQuoteReserves, p.Variants)...)
+	} else {
+		m.Violations = append(m.Violations, CheckConstantProductPair(
+			c.VirtualTokenReserves, c.VirtualQuoteReserves,
+			derived.InitialVirtualBase, derived.InitialVirtualQuote)...)
+	}
+	if !m.OK() {
 		m.PriceSource = "SUSPECT"
 		m.SuspectField, _ = DiagnosePair(
 			c.VirtualTokenReserves, c.VirtualQuoteReserves,
