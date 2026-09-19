@@ -19,6 +19,24 @@ as the account address when present, otherwise the address is derived from the
 mint for launchpads that support it.
 
     python scripts/audit_rows.py rows.csv --program 6EF8rrec... --rpc $SOLANA_RPC
+
+It then answers the follow-up question, which is the one that actually decides
+whether there is a bug at all: when the columns turn out to be faithful and the
+curve still looks odd, is that a real cohort or is it corruption?
+
+Two groupings settle it, and neither needs a second data source.
+
+* **Opening buckets.** A pump.fun curve states its own opening, exactly, as
+  `virtual_quote - real_quote` (see docs/CURVE_MATH.md). Bucket it across the
+  population: a real opening is shared by thousands of rows however far they
+  have traded, while a corrupted value is unique to its own row.
+* **Cohorts.** Group the odd curves by `complete` and by the per-curve mode
+  flags. `complete` is the one to check first -- a graduated curve freezes at
+  its final reserves while trading moves to the AMM, so its state stays
+  faithful to the account and stops being the market price. A feature that
+  explains the cohort shows a share far above its baseline.
+
+Both are printed, and both are in the `--json` report.
 """
 
 from __future__ import annotations
@@ -89,6 +107,35 @@ def first_present(state: Dict, *names: str) -> Optional[int]:
     return None
 
 
+#: per-curve features worth grouping a residual population by. `complete` is
+#: the one that costs nothing to check and explains the most: a graduated curve
+#: keeps reporting its final reserves while trading has moved to the AMM, so a
+#: price derived from it is faithful to the account and no longer the market.
+COHORT_FIELDS = (
+    "complete",
+    "is_mayhem_mode",
+    "is_cashback_coin",
+    "is_holder_reward",
+    "quote_mint",
+)
+
+
+def cohort_labels(state: Dict) -> Dict[str, str]:
+    """Group one curve by the per-curve features that could explain a cohort."""
+    out: Dict[str, str] = {}
+    for field in COHORT_FIELDS:
+        value = state.get(field)
+        if value is None:
+            continue  # the account predates the field
+        if isinstance(value, bool):
+            out[field] = "true" if value else "false"
+        elif isinstance(value, str):
+            out[field] = value
+        else:
+            out[field] = "set" if value else "unset"
+    return out
+
+
 def numeric_fields(state: Dict) -> Dict[str, int]:
     return {
         name: value
@@ -115,6 +162,12 @@ def audit(
     # its own row.
     opening_buckets: Counter = Counter()
     base_floor_buckets: Counter = Counter()
+    # Two explanations that do not need the pipeline to be at fault, both of
+    # which are one grouping away. A graduated curve freezes at its final state
+    # while trading moves to the AMM, so its reserves stay faithful and stop
+    # being the market price. And pump.fun carries per-curve mode flags that
+    # could plausibly carry their own seeds.
+    cohorts: Dict[str, Counter] = defaultdict(Counter)
     unreadable = 0
     examples: List[Dict] = []
 
@@ -173,8 +226,17 @@ def audit(
         # program would not create today, which an older build may well have.
         if any(name in w for w in warnings for name in _STRUCTURAL):
             invariant_failures += 1
-        if any("nonstandard_opening" in w for w in warnings):
+        unfamiliar = any("nonstandard_opening" in w for w in warnings)
+        if unfamiliar:
             nonstandard += 1
+
+        # Count each cohort twice: over all rows, and over the unfamiliar ones
+        # alone. A feature that explains the unfamiliar population shows up as
+        # a share far above its baseline; one that does not matches it.
+        for label, value in cohort_labels(state).items():
+            cohorts[label][("all", value)] += 1
+            if unfamiliar:
+                cohorts[label][("nonstandard", value)] += 1
 
         if mismatched and len(examples) < show_mismatches:
             examples.append(
@@ -193,6 +255,10 @@ def audit(
         "rows_with_a_nonstandard_opening": nonstandard,
         "opening_buckets": dict(opening_buckets.most_common(20)),
         "base_floor_buckets": dict(base_floor_buckets.most_common(20)),
+        "cohorts": {
+            label: {f"{scope}:{value}": count for (scope, value), count in counts.most_common()}
+            for label, counts in cohorts.items()
+        },
         "attribution": {col: dict(counts.most_common()) for col, counts in attribution.items()},
         "examples": examples,
     }
@@ -243,6 +309,35 @@ def main() -> None:
         "    below decide which you have -- a real opening is shared by thousands of\n"
         "    curves, a corrupted one is unique to its row.\n"
     )
+    if nonstandard and report["cohorts"]:
+        print(
+            "what the curves with an unfamiliar opening have in common:\n"
+            "    A feature that EXPLAINS them shows a share far above its baseline.\n"
+            "    `complete` is the one to look at first -- a graduated curve keeps\n"
+            "    reporting its final reserves while trading has moved to the AMM, so\n"
+            "    a price derived from it is faithful to the account and no longer the\n"
+            "    market price.\n"
+        )
+        for field, counts in report["cohorts"].items():
+            rows_all = {
+                k.split(":", 1)[1]: v for k, v in counts.items() if k.startswith("all:")
+            }
+            rows_odd = {
+                k.split(":", 1)[1]: v for k, v in counts.items() if k.startswith("nonstandard:")
+            }
+            total_all = sum(rows_all.values()) or 1
+            print(f"  {field}:")
+            for value, count in sorted(rows_all.items(), key=lambda kv: -kv[1])[:6]:
+                odd = rows_odd.get(value, 0)
+                baseline = count / total_all
+                share = odd / nonstandard
+                flag = "   <-- concentrated here" if share > baseline + 0.2 else ""
+                print(
+                    f"    {value:<24} all {count:>8,} ({baseline:>5.1%})   "
+                    f"unfamiliar {odd:>8,} ({share:>5.1%}){flag}"
+                )
+            print()
+
     for label, key in (
         ("opening quote reserve (virtual_quote - real_quote)", "opening_buckets"),
         ("opening base gap (virtual_base - real_base)", "base_floor_buckets"),

@@ -233,3 +233,87 @@ def test_structurally_impossible_state_is_still_a_failure():
     decoder = LaunchpadDecoder(source, resolve_mints=False)
     report = audit_rows.audit(decoder, [{"mint": mint}], PUMP.program_id)
     assert report["rows_failing_curve_invariant_on_chain"] == 1
+
+
+def test_cohorts_separate_a_graduated_population_from_the_rest():
+    """The grouping that settles 'is the residual a real cohort or corruption?'
+
+    A graduated curve freezes at its final reserves while trading moves to the
+    AMM, so its price stays faithful to the account and stops being the market
+    price. If that is what a residual population is, `complete` concentrates in
+    it -- and no amount of pipeline work would have fixed anything.
+    """
+    idl = json.loads((IDL_DIR / "pump.json").read_text())
+    schema = compile_idl(idl)
+    source = build([])
+
+    rows = []
+    # Four healthy curves on the seeded opening, still funding.
+    for i in range(4):
+        mint = mint_for(f"funding{i}")
+        paid = 5_000_000_000 * (i + 1)
+        v_quote = IVS + paid
+        v_base = (IVT * IVS) // v_quote
+        source.add_raw(
+            pdas.pumpfun_bonding_curve(mint),
+            PUMP.program_id,
+            encode_account(
+                idl,
+                schema,
+                "BondingCurve",
+                {
+                    "virtual_token_reserves": v_base,
+                    "virtual_quote_reserves": v_quote,
+                    "real_token_reserves": IRT - (IVT - v_base),
+                    "real_quote_reserves": paid,
+                    "token_total_supply": 1_000_000_000_000_000,
+                    "complete": False,
+                },
+            ),
+        )
+        rows.append({"mint": mint})
+
+    # Three curves on an opening this build does not use, all graduated.
+    for i in range(3):
+        mint = mint_for(f"graduated{i}")
+        source.add_raw(
+            pdas.pumpfun_bonding_curve(mint),
+            PUMP.program_id,
+            encode_account(
+                idl,
+                schema,
+                "BondingCurve",
+                {
+                    "virtual_token_reserves": 1_077_887_039_606_396,
+                    "virtual_quote_reserves": 18_204_928_211 + i,
+                    "real_token_reserves": IRT,
+                    "real_quote_reserves": 1,
+                    "token_total_supply": 1_000_000_000_000_000,
+                    "complete": True,
+                },
+            ),
+        )
+        rows.append({"mint": mint})
+
+    decoder = LaunchpadDecoder(source, resolve_mints=False)
+    report = audit_rows.audit(decoder, rows, PUMP.program_id)
+
+    assert report["rows_checked"] == 7
+    assert report["rows_failing_curve_invariant_on_chain"] == 0
+    assert report["rows_with_a_nonstandard_opening"] == 3
+
+    # Every unfamiliar curve is complete, while most of the population is not:
+    # the cohort is explained, and nothing is broken.
+    complete = report["cohorts"]["complete"]
+    assert complete["all:true"] == 3
+    assert complete["all:false"] == 4
+    assert complete["nonstandard:true"] == 3
+    assert "nonstandard:false" not in complete
+
+    # And the bucket histogram shows the shape to look for: the four healthy
+    # curves collapse into ONE opening however far they have traded, while the
+    # three odd ones each get their own. A real alternative seed would look
+    # like the first; corruption looks like the second.
+    buckets = report["opening_buckets"]
+    assert buckets[IVS] == 4
+    assert sorted(v for k, v in buckets.items() if k != IVS) == [1, 1, 1]
