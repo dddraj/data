@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "facebook-ads": {
+      "command": "python3",
+      "args": ["facebook_ads/run_server.py"],
+      "env": {
+        "META_ACCESS_TOKEN": "${META_ACCESS_TOKEN:-}",
+        "META_APP_SECRET": "${META_APP_SECRET:-}",
+        "FB_ADS_MAX_DAILY_BUDGET": "${FB_ADS_MAX_DAILY_BUDGET:-}",
+        "FB_ADS_READ_ONLY": "${FB_ADS_READ_ONLY:-}"
+      }
+    }
+  }
+}
